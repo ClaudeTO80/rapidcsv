@@ -15,10 +15,15 @@
 
 #include <algorithm>
 #include <cassert>
+#include <cctype>
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
 #include <fstream>
+#if defined(__cplusplus) && __cplusplus >= 201703L
+#include <charconv>
+#include <system_error>
+#endif
 #include <functional>
 #include <iomanip>
 #include <iostream>
@@ -243,6 +248,51 @@ namespace rapidcsv
           return;
         }
       }
+
+#if defined(__cplusplus) && __cplusplus >= 201703L
+      /**
+       * @brief   Locale-independent parsing of float and double via std::from_chars.
+       * @details std::from_chars accepts subnormal values, nan and inf, and only
+       *          succeeds when the whole string is consumed, so "3,5" is rejected
+       *          instead of being read as 3. Leading and trailing whitespace and a
+       *          leading '+' are handled here because std::from_chars does not accept
+       *          them. long double keeps the legacy path below.
+       */
+      if ((typeid(T) == typeid(float)) || (typeid(T) == typeid(double)))
+      {
+        const char* first = pStr.data();
+        const char* last = first + pStr.size();
+        while ((first != last) && std::isspace(static_cast<unsigned char>(*first)))
+        {
+          ++first;
+        }
+        while ((last != first) && std::isspace(static_cast<unsigned char>(*(last - 1))))
+        {
+          --last;
+        }
+        if ((first != last) && (*first == '+'))
+        {
+          ++first;
+        }
+        T val = T();
+        const std::from_chars_result res = std::from_chars(first, last, val);
+        if ((res.ec == std::errc()) && (res.ptr == last))
+        {
+          pVal = val;
+          return;
+        }
+        if (!mConverterParams.mHasDefaultConverter)
+        {
+          if (res.ec == std::errc::result_out_of_range)
+          {
+            throw std::out_of_range("conversion: out of range");
+          }
+          throw std::invalid_argument("from_chars: no conversion");
+        }
+        pVal = static_cast<T>(mConverterParams.mDefaultFloat);
+        return;
+      }
+#endif
 
       try
       {

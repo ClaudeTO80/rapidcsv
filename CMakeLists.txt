@@ -188,6 +188,11 @@ if(RAPIDCSV_BUILD_TESTS)
   add_unit_test(test113)
   add_unit_test(test114)
   add_unit_test(test115)
+  add_unit_test(test116)
+  if(TARGET test116)
+    # Exercises the std::from_chars path, which is only compiled as C++17.
+    set_target_properties(test116 PROPERTIES CXX_STANDARD 17 CXX_STANDARD_REQUIRED ON)
+  endif()
 
   # perf tests
   add_perf_test(ptest001)
