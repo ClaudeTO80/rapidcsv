@@ -2300,17 +2300,9 @@ namespace rapidcsv
         for (size_t c = 0; c < width; ++c)
         {
           mData.CopyCell(r, c, cell);
-          if (mSeparatorParams.mAutoQuote &&
-              ((cell.find(mSeparatorParams.mSeparator) != std::string::npos) ||
-               (cell.find(mSeparatorParams.mQuoteChar) != std::string::npos) ||
-               (cell.find_first_of(" \t\n\v\f\r") != std::string::npos)))
+          if (mSeparatorParams.mAutoQuote && NeedsQuote(cell))
           {
-            // escape quotes in string
-            std::string str = cell;
-            const std::string quoteCharStr = std::string(1, mSeparatorParams.mQuoteChar);
-            ReplaceString(str, quoteCharStr, quoteCharStr + quoteCharStr);
-
-            pStream << quoteCharStr << str << quoteCharStr;
+            WriteQuoted(pStream, cell);
           }
           else
           {
@@ -2324,6 +2316,46 @@ namespace rapidcsv
         }
         pStream << eol;
       }
+    }
+
+    /**
+     * @brief   Tells whether a cell must be quoted when written: it contains the separator,
+     *          the quote character or a whitespace character. Single pass over the cell.
+     */
+    bool NeedsQuote(const std::string& pCell) const
+    {
+      const char sep = mSeparatorParams.mSeparator;
+      const char quote = mSeparatorParams.mQuoteChar;
+      for (const char ch : pCell)
+      {
+        if (ch == sep || ch == quote || ch == ' ' || ch == '\t' || ch == '\n' ||
+            ch == '\v' || ch == '\f' || ch == '\r')
+        {
+          return true;
+        }
+      }
+      return false;
+    }
+
+    /**
+     * @brief   Writes a cell enclosed in quote characters, doubling each quote character inside.
+     * @details Writes the cell in runs between quotes instead of building an escaped copy.
+     */
+    void WriteQuoted(std::ostream& pStream, const std::string& pCell) const
+    {
+      const char quote = mSeparatorParams.mQuoteChar;
+      pStream << quote;
+      size_t start = 0;
+      size_t pos = pCell.find(quote);
+      while (pos != std::string::npos)
+      {
+        pStream.write(pCell.data() + start, static_cast<std::streamsize>(pos + 1 - start));
+        pStream << quote;
+        start = pos + 1;
+        pos = pCell.find(quote, start);
+      }
+      pStream.write(pCell.data() + start, static_cast<std::streamsize>(pCell.size() - start));
+      pStream << quote;
     }
 
     size_t GetDataRowCount() const
