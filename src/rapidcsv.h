@@ -26,6 +26,7 @@
 #include <locale>
 #include <map>
 #include <sstream>
+#include <stdexcept>
 #include <string>
 #include <typeinfo>
 #include <vector>
@@ -1177,12 +1178,9 @@ namespace rapidcsv
     template<typename T>
     T GetCell(const size_t pColumnIdx, const size_t pRowIdx) const
     {
-      const size_t dataColumnIdx = GetDataColumnIndex(pColumnIdx);
-      const size_t dataRowIdx = GetDataRowIndex(pRowIdx);
-
       T val;
       Converter<T> converter(mConverterParams);
-      converter.ToVal(mData.at(dataRowIdx).at(dataColumnIdx), val);
+      converter.ToVal(GetCellRef(pColumnIdx, pRowIdx), val);
       return val;
     }
 
@@ -1196,11 +1194,8 @@ namespace rapidcsv
     template<typename T>
     T GetCell(const size_t pColumnIdx, const size_t pRowIdx, ConvFunc<T> pToVal) const
     {
-      const size_t dataColumnIdx = GetDataColumnIndex(pColumnIdx);
-      const size_t dataRowIdx = GetDataRowIndex(pRowIdx);
-
       T val;
-      pToVal(mData.at(dataRowIdx).at(dataColumnIdx), val);
+      pToVal(GetCellRef(pColumnIdx, pRowIdx), val);
       return val;
     }
 
@@ -1726,6 +1721,15 @@ namespace rapidcsv
             }
             else
             {
+              // Without pQuotedLinebreaks a quoted field cannot span lines: a line break while
+              // a quote is still open would otherwise end the record and silently drop the quote
+              if (quoted)
+              {
+                const std::string errStr = "unterminated quoted field in record " +
+                  std::to_string(mData.size() + 1) + " (line break inside quotes requires pQuotedLinebreaks)";
+                throw std::runtime_error(errStr);
+              }
+
               ++lf;
               if (mLineReaderParams.mSkipEmptyLines && row.empty() && cell.empty())
               {
@@ -1759,6 +1763,13 @@ namespace rapidcsv
           }
         }
         p_FileLength -= readLength;
+      }
+
+      // An unterminated quoted field would otherwise swallow the rest of the input silently
+      if (quoted)
+      {
+        const std::string errStr = "unterminated quoted field in record " + std::to_string(mData.size() + 1);
+        throw std::runtime_error(errStr);
       }
 
       // Handle last row / cell without linebreak
@@ -1880,6 +1891,40 @@ namespace rapidcsv
       const size_t firstDataColumn =
         static_cast<size_t>((mLabelParams.mRowNameIdx + 1 >= 0) ? mLabelParams.mRowNameIdx + 1 : 0);
       return pColumnIdx + firstDataColumn;
+    }
+
+    /**
+     * @brief   Get the raw string of a data cell, with bounds checking.
+     * @details Reports the row and column indices passed by the caller, and the size of the
+     *          row that was accessed, so that rows shorter than the header are diagnosable.
+     * @param   pColumnIdx            zero-based column index, as passed by the caller.
+     * @param   pRowIdx               zero-based row index, as passed by the caller.
+     * @returns reference to the raw cell string.
+     * @throws  std::out_of_range if the row or the column does not exist.
+     */
+    const std::string& GetCellRef(const size_t pColumnIdx, const size_t pRowIdx) const
+    {
+      const size_t dataRowIdx = GetDataRowIndex(pRowIdx);
+      if (dataRowIdx >= mData.size())
+      {
+        const std::string errStr = "row index " + std::to_string(pRowIdx) +
+          " out of range (rows: " + std::to_string(GetRowCount()) + ")";
+        throw std::out_of_range(errStr);
+      }
+
+      const std::vector<std::string>& row = mData[dataRowIdx];
+      const size_t dataColumnIdx = GetDataColumnIndex(pColumnIdx);
+      if (dataColumnIdx >= row.size())
+      {
+        const size_t firstDataColumn = GetDataColumnIndex(0);
+        const size_t dataCells = (row.size() > firstDataColumn) ? row.size() - firstDataColumn : 0;
+        const std::string errStr = "column index " + std::to_string(pColumnIdx) +
+          " out of range for row " + std::to_string(pRowIdx) +
+          " (row has " + std::to_string(dataCells) + " cells)";
+        throw std::out_of_range(errStr);
+      }
+
+      return row[dataColumnIdx];
     }
 
     std::string Trim(const std::string& pStr) const
