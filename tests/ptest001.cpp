@@ -24,16 +24,16 @@ int main()
       timer.Stop();
 
       // dummy usage of variables
-      (void) column;
-      (void) row;
-      (void) cell;
+      (void)column;
+      (void)row;
+      (void)cell;
     }
 
     timer.ReportMedian();
   }
   catch (const std::exception& ex)
   {
-    std::cout << ex.what() << std::endl;
+    std::cout << "exception: " << ex.what() << std::endl;
     rv = 1;
   }
 

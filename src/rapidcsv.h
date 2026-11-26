@@ -2,9 +2,9 @@
  * rapidcsv.h
  *
  * URL:      https://github.com/d99kris/rapidcsv
- * Version:  8.84
+ * Version:  9.09
  *
- * Copyright (C) 2017-2024 Kristofer Berggren
+ * Copyright (c) 2017-2026 Kristofer Berggren
  * All rights reserved.
  *
  * rapidcsv is distributed under the BSD 3-Clause license, see LICENSE for details.
@@ -16,15 +16,14 @@
 #include <algorithm>
 #include <cassert>
 #include <cmath>
-#ifdef HAS_CODECVT
-#include <codecvt>
-#include <locale>
-#endif
+#include <cstddef>
+#include <cstdint>
 #include <fstream>
 #include <functional>
 #include <iomanip>
 #include <iostream>
 #include <limits>
+#include <locale>
 #include <map>
 #include <sstream>
 #include <string>
@@ -133,6 +132,8 @@ namespace rapidcsv
     void ToStr(const T& pVal, std::string& pStr) const
     {
       if (typeid(T) == typeid(int) ||
+          typeid(T) == typeid(short) ||
+          typeid(T) == typeid(unsigned short) ||
           typeid(T) == typeid(long) ||
           typeid(T) == typeid(long long) ||
           typeid(T) == typeid(unsigned) ||
@@ -157,6 +158,18 @@ namespace rapidcsv
         out << std::setprecision(17) << pVal;
         pStr = out.str();
       }
+      else if (typeid(T) == typeid(signed char))
+      {
+        std::ostringstream out;
+        out << static_cast<int>(pVal);
+        pStr = out.str();
+      }
+      else if (typeid(T) == typeid(unsigned char))
+      {
+        std::ostringstream out;
+        out << static_cast<unsigned int>(pVal);
+        pStr = out.str();
+      }
       else
       {
         throw no_converter();
@@ -177,6 +190,18 @@ namespace rapidcsv
           pVal = static_cast<T>(std::stoi(pStr));
           return;
         }
+        else if ((typeid(T) == typeid(signed char)) || (typeid(T) == typeid(unsigned char)) ||
+                 (typeid(T) == typeid(short)) || (typeid(T) == typeid(unsigned short)))
+        {
+          const int i = std::stoi(pStr);
+          if ((i < static_cast<int>((std::numeric_limits<T>::min)())) ||
+              (i > static_cast<int>((std::numeric_limits<T>::max)())))
+          {
+            throw std::out_of_range("conversion: out of range");
+          }
+          pVal = static_cast<T>(i);
+          return;
+        }
         else if (typeid(T) == typeid(long))
         {
           pVal = static_cast<T>(std::stol(pStr));
@@ -187,19 +212,22 @@ namespace rapidcsv
           pVal = static_cast<T>(std::stoll(pStr));
           return;
         }
-        else if (typeid(T) == typeid(unsigned))
+        else if ((typeid(T) == typeid(unsigned)) || (typeid(T) == typeid(unsigned long)) ||
+                 (typeid(T) == typeid(unsigned long long)))
         {
-          pVal = static_cast<T>(std::stoul(pStr));
-          return;
-        }
-        else if (typeid(T) == typeid(unsigned long))
-        {
-          pVal = static_cast<T>(std::stoul(pStr));
-          return;
-        }
-        else if (typeid(T) == typeid(unsigned long long))
-        {
-          pVal = static_cast<T>(std::stoull(pStr));
+          const unsigned long long ull = std::stoull(pStr);
+          const T val = static_cast<T>(ull);
+
+          // std::stoull() wraps negative values around, instead of throwing
+          const size_t signPos = pStr.find_first_not_of(" \f\n\r\t\v");
+          const bool isNegative =
+            (ull != 0) && (signPos != std::string::npos) && (pStr.at(signPos) == '-');
+
+          if (isNegative || (static_cast<unsigned long long>(val) != ull))
+          {
+            throw std::out_of_range("conversion: out of range");
+          }
+          pVal = val;
           return;
         }
       }
@@ -304,7 +332,7 @@ namespace rapidcsv
   }
 
   template<typename T>
-  using ConvFunc = std::function<void (const std::string & pStr, T & pVal)>;
+  using ConvFunc = std::function<void (const std::string& pStr, T& pVal)>;
 
   /**
    * @brief     Datastructure holding parameters controlling which row and column should be
@@ -593,15 +621,15 @@ namespace rapidcsv
       mData.clear();
       mColumnNames.clear();
       mRowNames.clear();
-#ifdef HAS_CODECVT
       mIsUtf16 = false;
       mIsLE = false;
-#endif
       mHasUtf8BOM = false;
     }
 
     /**
-     * @brief   Get column index by name.
+     * @brief   Get column index by name. The result is undefined if the document contains
+     *          multiple columns sharing the same label name. Column indices exceeding
+     *          INT_MAX are not supported.
      * @param   pColumnName           column label name.
      * @returns zero-based column index.
      */
@@ -732,7 +760,10 @@ namespace rapidcsv
         {
           if (std::distance(mData.begin(), itRow) >= mLabelParams.mColumnNameIdx)
           {
-            itRow->resize(GetDataColumnIndex(dataColumnIdx + 1));
+            if (itRow->size() < (dataColumnIdx + 1))
+            {
+              itRow->resize(dataColumnIdx + 1);
+            }
           }
         }
       }
@@ -774,7 +805,18 @@ namespace rapidcsv
       {
         if (std::distance(mData.begin(), itRow) >= mLabelParams.mColumnNameIdx)
         {
-          itRow->erase(itRow->begin() + static_cast<int>(dataColumnIdx));
+          if (dataColumnIdx < itRow->size())
+          {
+            itRow->erase(itRow->begin() + static_cast<std::ptrdiff_t>(dataColumnIdx));
+          }
+          else
+          {
+            const std::string errStr = "column out of range: " +
+              std::to_string(pColumnIdx) + " (on row " +
+              std::to_string(std::distance(mData.begin(), itRow)) +
+              ")";
+            throw std::out_of_range(errStr);
+          }
         }
       }
 
@@ -841,7 +883,18 @@ namespace rapidcsv
         if (std::distance(mData.begin(), itRow) >= mLabelParams.mColumnNameIdx)
         {
           const size_t rowIdx = static_cast<size_t>(std::distance(mData.begin(), itRow));
-          itRow->insert(itRow->begin() + static_cast<int>(dataColumnIdx), column.at(rowIdx));
+          if (dataColumnIdx <= itRow->size())
+          {
+            itRow->insert(itRow->begin() + static_cast<std::ptrdiff_t>(dataColumnIdx), column.at(rowIdx));
+          }
+          else
+          {
+            const std::string errStr = "column out of range: " +
+              std::to_string(pColumnIdx) + " (on row " +
+              std::to_string(std::distance(mData.begin(), itRow)) +
+              ")";
+            throw std::out_of_range(errStr);
+          }
         }
       }
 
@@ -859,13 +912,17 @@ namespace rapidcsv
      */
     size_t GetColumnCount() const
     {
-      const int count = static_cast<int>((mData.size() > 0) ? mData.at(0).size() : 0) -
+      const size_t firstRow = static_cast<size_t>((mLabelParams.mColumnNameIdx >= 0) ? mLabelParams.mColumnNameIdx : 0);
+      const std::ptrdiff_t count =
+        static_cast<std::ptrdiff_t>((mData.size() > firstRow) ? mData.at(firstRow).size() : 0) -
         (mLabelParams.mRowNameIdx + 1);
       return (count >= 0) ? static_cast<size_t>(count) : 0;
     }
 
     /**
-     * @brief   Get row index by name.
+     * @brief   Get row index by name. The result is undefined if the document contains
+     *          multiple rows sharing the same label name. Row indices exceeding INT_MAX
+     *          are not supported.
      * @param   pRowName              row label name.
      * @returns zero-based row index.
      */
@@ -978,13 +1035,16 @@ namespace rapidcsv
         mData.push_back(row);
       }
 
-      if (pRow.size() > GetDataColumnCount())
+      if (GetDataColumnIndex(pRow.size()) > GetDataColumnCount())
       {
         for (auto itRow = mData.begin(); itRow != mData.end(); ++itRow)
         {
           if (std::distance(mData.begin(), itRow) >= mLabelParams.mColumnNameIdx)
           {
-            itRow->resize(GetDataColumnIndex(pRow.size()));
+            if (itRow->size() < GetDataColumnIndex(pRow.size()))
+            {
+              itRow->resize(GetDataColumnIndex(pRow.size()));
+            }
           }
         }
       }
@@ -1022,7 +1082,17 @@ namespace rapidcsv
     void RemoveRow(const size_t pRowIdx)
     {
       const size_t dataRowIdx = GetDataRowIndex(pRowIdx);
-      mData.erase(mData.begin() + static_cast<int>(dataRowIdx));
+      if (dataRowIdx < mData.size())
+      {
+        mData.erase(mData.begin() + static_cast<std::ptrdiff_t>(dataRowIdx));
+      }
+      else
+      {
+        const std::string errStr = "row out of range: " +
+          std::to_string(pRowIdx);
+        throw std::out_of_range(errStr);
+      }
+
       UpdateRowNames();
     }
 
@@ -1077,7 +1147,7 @@ namespace rapidcsv
         mData.push_back(tempRow);
       }
 
-      mData.insert(mData.begin() + static_cast<int>(rowIdx), row);
+      mData.insert(mData.begin() + static_cast<std::ptrdiff_t>(rowIdx), row);
 
       if (!pRowName.empty())
       {
@@ -1093,7 +1163,8 @@ namespace rapidcsv
      */
     size_t GetRowCount() const
     {
-      const int count = static_cast<int>(mData.size()) - (mLabelParams.mColumnNameIdx + 1);
+      const std::ptrdiff_t count = static_cast<std::ptrdiff_t>(mData.size()) -
+        (mLabelParams.mColumnNameIdx + 1);
       return (count >= 0) ? static_cast<size_t>(count) : 0;
     }
 
@@ -1281,7 +1352,10 @@ namespace rapidcsv
         {
           if (std::distance(mData.begin(), itRow) >= mLabelParams.mColumnNameIdx)
           {
-            itRow->resize(dataColumnIdx + 1);
+            if (itRow->size() < (dataColumnIdx + 1))
+            {
+              itRow->resize(dataColumnIdx + 1);
+            }
           }
         }
       }
@@ -1381,6 +1455,14 @@ namespace rapidcsv
       }
 
       const size_t dataColumnIdx = GetDataColumnIndex(pColumnIdx);
+
+      // remove old name from map before adding new one
+      const size_t nameRowIdx = static_cast<size_t>(mLabelParams.mColumnNameIdx);
+      if ((nameRowIdx < mData.size()) && (dataColumnIdx < mData.at(nameRowIdx).size()))
+      {
+        const std::string oldName = mData.at(nameRowIdx).at(dataColumnIdx);
+        mColumnNames.erase(oldName);
+      }
       mColumnNames[pColumnName] = dataColumnIdx;
 
       // increase table size if necessary:
@@ -1389,7 +1471,8 @@ namespace rapidcsv
       {
         mData.resize(rowIdx + 1);
       }
-      auto& row = mData[rowIdx];
+
+      std::vector<std::string>& row = mData[rowIdx];
       if (dataColumnIdx >= row.size())
       {
         row.resize(dataColumnIdx + 1);
@@ -1406,9 +1489,12 @@ namespace rapidcsv
     {
       if (mLabelParams.mColumnNameIdx >= 0)
       {
-        return std::vector<std::string>(mData.at(static_cast<size_t>(mLabelParams.mColumnNameIdx)).begin() +
-                                        (mLabelParams.mRowNameIdx + 1),
-                                        mData.at(static_cast<size_t>(mLabelParams.mColumnNameIdx)).end());
+        const std::vector<std::string>& labelRow = mData.at(static_cast<size_t>(mLabelParams.mColumnNameIdx));
+        const size_t offset = static_cast<size_t>(mLabelParams.mRowNameIdx + 1);
+        if (offset <= labelRow.size())
+        {
+          return std::vector<std::string>(labelRow.begin() + static_cast<std::ptrdiff_t>(offset), labelRow.end());
+        }
       }
 
       return std::vector<std::string>();
@@ -1438,6 +1524,14 @@ namespace rapidcsv
     void SetRowName(size_t pRowIdx, const std::string& pRowName)
     {
       const size_t dataRowIdx = GetDataRowIndex(pRowIdx);
+
+      // remove old name from map before adding new one
+      if ((mLabelParams.mRowNameIdx >= 0) && (dataRowIdx < mData.size()) &&
+          (static_cast<size_t>(mLabelParams.mRowNameIdx) < mData.at(dataRowIdx).size()))
+      {
+        const std::string oldName = mData.at(dataRowIdx).at(static_cast<size_t>(mLabelParams.mRowNameIdx));
+        mRowNames.erase(oldName);
+      }
       mRowNames[pRowName] = dataRowIdx;
       if (mLabelParams.mRowNameIdx < 0)
       {
@@ -1449,8 +1543,9 @@ namespace rapidcsv
       {
         mData.resize(dataRowIdx + 1);
       }
-      auto& row = mData[dataRowIdx];
-      if (mLabelParams.mRowNameIdx >= static_cast<int>(row.size()))
+
+      std::vector<std::string>& row = mData[dataRowIdx];
+      if (mLabelParams.mRowNameIdx >= static_cast<std::ptrdiff_t>(row.size()))
       {
         row.resize(static_cast<size_t>(mLabelParams.mRowNameIdx) + 1);
       }
@@ -1494,7 +1589,6 @@ namespace rapidcsv
       std::streamsize length = pStream.tellg();
       pStream.seekg(0, std::ios::beg);
 
-#ifdef HAS_CODECVT
       std::vector<char> bom2b(2, '\0');
       if (length >= 2)
       {
@@ -1509,30 +1603,16 @@ namespace rapidcsv
         mIsUtf16 = true;
         mIsLE = (bom2b == bomU16le);
 
-        std::wifstream wstream;
-        wstream.exceptions(std::wifstream::failbit | std::wifstream::badbit);
-        wstream.open(mPath, std::ios::binary);
-        if (mIsLE)
-        {
-          wstream.imbue(std::locale(wstream.getloc(),
-                                    new std::codecvt_utf16<wchar_t, 0x10ffff,
-                                                           static_cast<std::codecvt_mode>(std::consume_header |
-                                                                                          std::little_endian)>));
-        }
-        else
-        {
-          wstream.imbue(std::locale(wstream.getloc(),
-                                    new std::codecvt_utf16<wchar_t, 0x10ffff,
-                                                           std::consume_header>));
-        }
-        std::wstringstream wss;
-        wss << wstream.rdbuf();
-        std::string utf8 = ToString(wss.str());
+        std::vector<char> buffer(static_cast<size_t>(length));
+        pStream.read(buffer.data(), length);
+
+        // skip byte order mark
+        const std::string utf8 = Utf16ToUtf8(buffer.data() + 2, static_cast<size_t>(length) - 2,
+                                             mIsLE);
         std::stringstream ss(utf8);
         ParseCsv(ss, static_cast<std::streamsize>(utf8.size()));
       }
       else
-#endif
       {
         // check for UTF-8 Byte order mark and skip it when found
         if (length >= 3)
@@ -1555,6 +1635,21 @@ namespace rapidcsv
 
         ParseCsv(pStream, length);
       }
+    }
+
+    static inline void CheckMaxCount(const size_t pCount)
+    {
+#ifdef RAPIDCSV_MAX_COUNT
+      static_assert(RAPIDCSV_MAX_COUNT > 0, "RAPIDCSV_MAX_COUNT must be a positive value");
+      static const size_t s_MaxCount = static_cast<size_t>(RAPIDCSV_MAX_COUNT);
+      if (pCount > s_MaxCount)
+      {
+        const std::string errStr = "max count exceeded: " + std::to_string(s_MaxCount);
+        throw std::out_of_range(errStr);
+      }
+#else
+      (void)pCount;
+#endif
     }
 
     void ParseCsv(std::istream& pStream, std::streamsize p_FileLength)
@@ -1592,7 +1687,7 @@ namespace rapidcsv
             {
               // allow whitespace before first mQuoteChar
               const auto firstQuote = std::find(cell.begin(), cell.end(), mSeparatorParams.mQuoteChar);
-              if (std::all_of(cell.begin(), firstQuote, [](int ch) { return isspace(ch); }))
+              if (std::all_of(cell.begin(), firstQuote, [](unsigned char ch) { return isspace(ch); }))
               {
                 quoted = !quoted;
               }
@@ -1603,6 +1698,7 @@ namespace rapidcsv
           {
             if (!quoted)
             {
+              CheckMaxCount(row.size() + 1);
               row.push_back(Unquote(Trim(cell)));
               cell.clear();
             }
@@ -1637,6 +1733,7 @@ namespace rapidcsv
               }
               else
               {
+                CheckMaxCount(row.size() + 1);
                 row.push_back(Unquote(Trim(cell)));
 
                 if (mLineReaderParams.mSkipCommentLines && !row.at(0).empty() &&
@@ -1646,6 +1743,7 @@ namespace rapidcsv
                 }
                 else
                 {
+                  CheckMaxCount(mData.size() + 1);
                   mData.push_back(row);
                 }
 
@@ -1670,6 +1768,7 @@ namespace rapidcsv
       }
       else
       {
+        CheckMaxCount(row.size() + 1);
         row.push_back(Unquote(Trim(cell)));
 
         if (mLineReaderParams.mSkipCommentLines && !row.at(0).empty() &&
@@ -1679,6 +1778,7 @@ namespace rapidcsv
         }
         else
         {
+          CheckMaxCount(mData.size() + 1);
           mData.push_back(row);
         }
 
@@ -1699,35 +1799,18 @@ namespace rapidcsv
 
     void WriteCsv() const
     {
-#ifdef HAS_CODECVT
       if (mIsUtf16)
       {
         std::stringstream ss;
         WriteCsv(ss);
-        std::string utf8 = ss.str();
-        std::wstring wstr = ToWString(utf8);
+        const std::string utf16 = Utf8ToUtf16(ss.str(), mIsLE);
 
-        std::wofstream wstream;
-        wstream.exceptions(std::wofstream::failbit | std::wofstream::badbit);
-        wstream.open(mPath, std::ios::binary | std::ios::trunc);
-
-        if (mIsLE)
-        {
-          wstream.imbue(std::locale(wstream.getloc(),
-                                    new std::codecvt_utf16<wchar_t, 0x10ffff,
-                                                           static_cast<std::codecvt_mode>(std::little_endian)>));
-        }
-        else
-        {
-          wstream.imbue(std::locale(wstream.getloc(),
-                                    new std::codecvt_utf16<wchar_t, 0x10ffff>));
-        }
-
-        wstream << static_cast<wchar_t>(0xfeff);
-        wstream << wstr;
+        std::ofstream stream;
+        stream.exceptions(std::ofstream::failbit | std::ofstream::badbit);
+        stream.open(mPath, std::ios::binary | std::ios::trunc);
+        stream.write(utf16.data(), static_cast<std::streamsize>(utf16.size()));
       }
       else
-#endif
       {
         std::ofstream stream;
         stream.exceptions(std::ofstream::failbit | std::ofstream::badbit);
@@ -1749,8 +1832,8 @@ namespace rapidcsv
         {
           if (mSeparatorParams.mAutoQuote &&
               ((itc->find(mSeparatorParams.mSeparator) != std::string::npos) ||
-               (itc->find(' ') != std::string::npos) ||
-               (itc->find('\n') != std::string::npos)))
+               (itc->find(mSeparatorParams.mQuoteChar) != std::string::npos) ||
+               (itc->find_first_of(" \t\n\v\f\r") != std::string::npos)))
           {
             // escape quotes in string
             std::string str = *itc;
@@ -1780,19 +1863,22 @@ namespace rapidcsv
 
     size_t GetDataColumnCount() const
     {
-      const size_t firstDataRow = static_cast<size_t>((mLabelParams.mColumnNameIdx >= 0) ? mLabelParams.mColumnNameIdx : 0);
+      const size_t firstDataRow =
+        static_cast<size_t>((mLabelParams.mColumnNameIdx >= 0) ? mLabelParams.mColumnNameIdx : 0);
       return (mData.size() > firstDataRow) ? mData.at(firstDataRow).size() : 0;
     }
 
     inline size_t GetDataRowIndex(const size_t pRowIdx) const
     {
-      const size_t firstDataRow = static_cast<size_t>((mLabelParams.mColumnNameIdx + 1 >= 0) ? mLabelParams.mColumnNameIdx + 1 : 0);
+      const size_t firstDataRow =
+        static_cast<size_t>((mLabelParams.mColumnNameIdx + 1 >= 0) ? mLabelParams.mColumnNameIdx + 1 : 0);
       return pRowIdx + firstDataRow;
     }
 
     inline size_t GetDataColumnIndex(const size_t pColumnIdx) const
     {
-      const size_t firstDataColumn = static_cast<size_t>((mLabelParams.mRowNameIdx + 1 >= 0) ? mLabelParams.mRowNameIdx + 1 : 0);
+      const size_t firstDataColumn =
+        static_cast<size_t>((mLabelParams.mRowNameIdx + 1 >= 0) ? mLabelParams.mRowNameIdx + 1 : 0);
       return pColumnIdx + firstDataColumn;
     }
 
@@ -1803,10 +1889,12 @@ namespace rapidcsv
         std::string str = pStr;
 
         // ltrim
-        str.erase(str.begin(), std::find_if(str.begin(), str.end(), [](int ch) { return !isspace(ch); }));
+        str.erase(str.begin(), std::find_if(str.begin(), str.end(), [](unsigned char ch) { return !isspace(ch); }));
 
         // rtrim
-        str.erase(std::find_if(str.rbegin(), str.rend(), [](int ch) { return !isspace(ch); }).base(), str.end());
+        str.erase(std::find_if(str.rbegin(), str.rend(), [](unsigned char ch) {
+          return !isspace(ch);
+        }).base(), str.end());
 
         return str;
       }
@@ -1841,7 +1929,7 @@ namespace rapidcsv
     {
       mColumnNames.clear();
       if ((mLabelParams.mColumnNameIdx >= 0) &&
-          (static_cast<int>(mData.size()) > mLabelParams.mColumnNameIdx))
+          (static_cast<std::ptrdiff_t>(mData.size()) > mLabelParams.mColumnNameIdx))
       {
         size_t i = 0;
         for (auto& columnName : mData[static_cast<size_t>(mLabelParams.mColumnNameIdx)])
@@ -1855,38 +1943,208 @@ namespace rapidcsv
     {
       mRowNames.clear();
       if ((mLabelParams.mRowNameIdx >= 0) &&
-          (static_cast<int>(mData.size()) >
+          (static_cast<std::ptrdiff_t>(mData.size()) >
            (mLabelParams.mColumnNameIdx + 1)))
       {
         size_t i = 0;
         for (auto& dataRow : mData)
         {
-          if (static_cast<int>(dataRow.size()) > mLabelParams.mRowNameIdx)
+          // rows too short to hold a row label are left unnamed, but must still be counted
+          if (static_cast<std::ptrdiff_t>(dataRow.size()) > mLabelParams.mRowNameIdx)
           {
-            mRowNames[dataRow[static_cast<size_t>(mLabelParams.mRowNameIdx)]] = i++;
+            mRowNames[dataRow[static_cast<size_t>(mLabelParams.mRowNameIdx)]] = i;
           }
+          ++i;
         }
       }
     }
 
-#ifdef HAS_CODECVT
-#if defined(_MSC_VER)
-#pragma warning (push)
-#pragma warning (disable: 4996)
-#endif
-    static std::string ToString(const std::wstring& pWStr)
+    // Unicode code point used in place of malformed input.
+    static const uint32_t s_ReplacementChar = 0x0000fffd;
+
+    // Reads the UTF-16 code unit at byte offset pIdx, which must be a valid offset
+    // of a complete code unit.
+    static uint32_t GetUtf16Unit(const char* pData, size_t pIdx, bool pIsLE)
     {
-      return std::wstring_convert<std::codecvt_utf8<wchar_t>, wchar_t>{ }.to_bytes(pWStr);
+      const uint32_t byte0 = static_cast<unsigned char>(pData[pIdx]);
+      const uint32_t byte1 = static_cast<unsigned char>(pData[pIdx + 1]);
+      return pIsLE ? ((byte1 << 8) | byte0) : ((byte0 << 8) | byte1);
     }
 
-    static std::wstring ToWString(const std::string& pStr)
+    static void AppendUtf16Unit(uint32_t pUnit, bool pIsLE, std::string& pUtf16)
     {
-      return std::wstring_convert<std::codecvt_utf8<wchar_t>, wchar_t>{ }.from_bytes(pStr);
+      const char lowByte = static_cast<char>(pUnit & 0xff);
+      const char highByte = static_cast<char>((pUnit >> 8) & 0xff);
+      pUtf16 += pIsLE ? lowByte : highByte;
+      pUtf16 += pIsLE ? highByte : lowByte;
     }
-#if defined(_MSC_VER)
-#pragma warning (pop)
-#endif
-#endif
+
+    static void AppendUtf16(uint32_t pCodePoint, bool pIsLE, std::string& pUtf16)
+    {
+      if (pCodePoint >= 0x10000)
+      {
+        // encode as surrogate pair
+        const uint32_t offset = pCodePoint - 0x10000;
+        AppendUtf16Unit(0xd800 + (offset >> 10), pIsLE, pUtf16);
+        AppendUtf16Unit(0xdc00 + (offset & 0x3ff), pIsLE, pUtf16);
+      }
+      else
+      {
+        AppendUtf16Unit(pCodePoint, pIsLE, pUtf16);
+      }
+    }
+
+    static void AppendUtf8(uint32_t pCodePoint, std::string& pUtf8)
+    {
+      if (pCodePoint < 0x80)
+      {
+        pUtf8 += static_cast<char>(pCodePoint);
+      }
+      else if (pCodePoint < 0x800)
+      {
+        pUtf8 += static_cast<char>(0xc0 | (pCodePoint >> 6));
+        pUtf8 += static_cast<char>(0x80 | (pCodePoint & 0x3f));
+      }
+      else if (pCodePoint < 0x10000)
+      {
+        pUtf8 += static_cast<char>(0xe0 | (pCodePoint >> 12));
+        pUtf8 += static_cast<char>(0x80 | ((pCodePoint >> 6) & 0x3f));
+        pUtf8 += static_cast<char>(0x80 | (pCodePoint & 0x3f));
+      }
+      else
+      {
+        pUtf8 += static_cast<char>(0xf0 | (pCodePoint >> 18));
+        pUtf8 += static_cast<char>(0x80 | ((pCodePoint >> 12) & 0x3f));
+        pUtf8 += static_cast<char>(0x80 | ((pCodePoint >> 6) & 0x3f));
+        pUtf8 += static_cast<char>(0x80 | (pCodePoint & 0x3f));
+      }
+    }
+
+    // Converts UTF-16 encoded data (without byte order mark) to UTF-8. Surrogate pairs
+    // are combined into a single code point. Unpaired surrogates and a trailing odd byte
+    // are replaced with U+FFFD.
+    static std::string Utf16ToUtf8(const char* pData, size_t pSize, bool pIsLE)
+    {
+      std::string utf8;
+      utf8.reserve(pSize);
+
+      size_t idx = 0;
+      while ((idx + 1) < pSize)
+      {
+        uint32_t codePoint = GetUtf16Unit(pData, idx, pIsLE);
+        idx += 2;
+
+        if ((codePoint >= 0xd800) && (codePoint <= 0xdbff) && ((idx + 1) < pSize))
+        {
+          // high surrogate - combine with low surrogate, when present
+          const uint32_t lowSurrogate = GetUtf16Unit(pData, idx, pIsLE);
+          if ((lowSurrogate >= 0xdc00) && (lowSurrogate <= 0xdfff))
+          {
+            codePoint = 0x10000 + ((codePoint - 0xd800) << 10) + (lowSurrogate - 0xdc00);
+            idx += 2;
+          }
+        }
+
+        if ((codePoint >= 0xd800) && (codePoint <= 0xdfff))
+        {
+          // unpaired surrogate
+          codePoint = s_ReplacementChar;
+        }
+
+        AppendUtf8(codePoint, utf8);
+      }
+
+      if (idx < pSize)
+      {
+        // trailing odd byte
+        AppendUtf8(s_ReplacementChar, utf8);
+      }
+
+      return utf8;
+    }
+
+    // Converts UTF-8 encoded data to UTF-16, prefixed with a byte order mark. Code points
+    // outside the basic multilingual plane are encoded as surrogate pairs. Malformed input
+    // is replaced with U+FFFD.
+    static std::string Utf8ToUtf16(const std::string& pUtf8, bool pIsLE)
+    {
+      std::string utf16;
+      utf16.reserve((pUtf8.size() + 1) * 2);
+
+      AppendUtf16(0x0000feff, pIsLE, utf16);
+
+      size_t idx = 0;
+      while (idx < pUtf8.size())
+      {
+        const uint32_t leadByte = static_cast<unsigned char>(pUtf8[idx]);
+        uint32_t codePoint = 0;
+        size_t seqLen = 0;
+
+        if (leadByte < 0x80)
+        {
+          codePoint = leadByte;
+          seqLen = 1;
+        }
+        else if ((leadByte & 0xe0) == 0xc0)
+        {
+          codePoint = leadByte & 0x1f;
+          seqLen = 2;
+        }
+        else if ((leadByte & 0xf0) == 0xe0)
+        {
+          codePoint = leadByte & 0x0f;
+          seqLen = 3;
+        }
+        else if ((leadByte & 0xf8) == 0xf0)
+        {
+          codePoint = leadByte & 0x07;
+          seqLen = 4;
+        }
+        else
+        {
+          // invalid lead byte
+          codePoint = s_ReplacementChar;
+          seqLen = 1;
+        }
+
+        if ((seqLen > 1) && ((idx + seqLen) <= pUtf8.size()))
+        {
+          for (size_t byteIdx = 1; byteIdx < seqLen; ++byteIdx)
+          {
+            const uint32_t contByte = static_cast<unsigned char>(pUtf8[idx + byteIdx]);
+            if ((contByte & 0xc0) != 0x80)
+            {
+              // invalid continuation byte
+              codePoint = s_ReplacementChar;
+              seqLen = 1;
+              break;
+            }
+
+            codePoint = (codePoint << 6) | (contByte & 0x3f);
+          }
+        }
+        else if (seqLen > 1)
+        {
+          // truncated sequence
+          codePoint = s_ReplacementChar;
+          seqLen = 1;
+        }
+
+        // reject out of range code points, surrogates and overlong sequences
+        static const uint32_t minCodePoint[5] = { 0, 0, 0x80, 0x800, 0x10000 };
+        if ((codePoint > 0x0010ffff) ||
+            ((codePoint >= 0xd800) && (codePoint <= 0xdfff)) ||
+            (codePoint < minCodePoint[seqLen]))
+        {
+          codePoint = s_ReplacementChar;
+        }
+
+        AppendUtf16(codePoint, pIsLE, utf16);
+        idx += seqLen;
+      }
+
+      return utf16;
+    }
 
     static void ReplaceString(std::string& pStr, const std::string& pSearch, const std::string& pReplace)
     {
@@ -1908,10 +2166,8 @@ namespace rapidcsv
     std::vector<std::vector<std::string>> mData;
     std::map<std::string, size_t> mColumnNames;
     std::map<std::string, size_t> mRowNames;
-#ifdef HAS_CODECVT
     bool mIsUtf16 = false;
     bool mIsLE = false;
-#endif
     bool mHasUtf8BOM = false;
   };
 }

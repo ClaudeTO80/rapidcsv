@@ -1,6 +1,7 @@
 # Project
 cmake_minimum_required(VERSION 3.14...3.22 FATAL_ERROR)
 project(rapidcsv VERSION 1.0 LANGUAGES CXX)
+include(CMakePackageConfigHelpers)
 set (CMAKE_CXX_STANDARD 11)
 if(MSVC)
   if(CMAKE_CXX_FLAGS MATCHES "/W[0-4]")
@@ -30,7 +31,10 @@ endif()
 
 # Library
 add_library(rapidcsv INTERFACE)
-target_include_directories(rapidcsv INTERFACE src)
+target_include_directories(rapidcsv INTERFACE
+  $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/src>
+  $<INSTALL_INTERFACE:include>
+)
 
 # Tests
 option(RAPIDCSV_BUILD_TESTS "Build tests" OFF)
@@ -46,17 +50,6 @@ if(RAPIDCSV_BUILD_TESTS)
   if(CCACHE_PROGRAM)
     message(STATUS "Found ccache")
     set_property(GLOBAL PROPERTY RULE_LAUNCH_COMPILE "${CCACHE_PROGRAM}")
-  endif()
-
-  # Enable codecvt tests if supported
-  if (CMAKE_CXX_STANDARD VERSION_LESS "17")
-    include(CheckIncludeFileCXX)
-    check_include_file_cxx(codecvt HAS_CODECVT)
-    if(HAS_CODECVT)
-      target_compile_definitions(rapidcsv INTERFACE HAS_CODECVT)
-    endif()
-  else()
-    message(STATUS "Skip check for C++ include codecvt - C++${CMAKE_CXX_STANDARD}")
   endif()
 
   # Test macro add_perf_test
@@ -136,12 +129,10 @@ if(RAPIDCSV_BUILD_TESTS)
   add_unit_test(test054)
   add_unit_test(test055)
   add_unit_test(test056)
-  if(HAS_CODECVT)
-    add_unit_test(test057)
-    add_unit_test(test058)
-    add_unit_test(test059)
-    add_unit_test(test060)
-  endif()
+  add_unit_test(test057)
+  add_unit_test(test058)
+  add_unit_test(test059)
+  add_unit_test(test060)
   add_unit_test(test061)
   add_unit_test(test062)
   add_unit_test(test063)
@@ -166,9 +157,7 @@ if(RAPIDCSV_BUILD_TESTS)
   add_unit_test(test082)
   add_unit_test(test083)
   add_unit_test(test084)
-  if(HAS_CODECVT)
-    add_unit_test(test085)
-  endif()
+  add_unit_test(test085)
   add_unit_test(test086)
   add_unit_test(test087)
   add_unit_test(test088)
@@ -182,6 +171,23 @@ if(RAPIDCSV_BUILD_TESTS)
   add_unit_test(test096)
   add_unit_test(test097)
   add_unit_test(test098)
+  add_unit_test(test099)
+  add_unit_test(test100)
+  add_unit_test(test101)
+  add_unit_test(test102)
+  add_unit_test(test103)
+  add_unit_test(test104)
+  add_unit_test(test105)
+  add_unit_test(test106)
+  add_unit_test(test107)
+  add_unit_test(test108)
+  add_unit_test(test109)
+  add_unit_test(test110)
+  add_unit_test(test111)
+  add_unit_test(test112)
+  add_unit_test(test113)
+  add_unit_test(test114)
+  add_unit_test(test115)
 
   # perf tests
   add_perf_test(ptest001)
@@ -212,12 +218,29 @@ endif()
 if(CMAKE_SOURCE_DIR STREQUAL PROJECT_SOURCE_DIR)
   message(STATUS "Install/uninstall targets enabled.")
 
-  # Install
+  # Install header
   install(FILES ${CMAKE_CURRENT_SOURCE_DIR}/src/rapidcsv.h DESTINATION include)
 
+  # Export targets
+  install(TARGETS rapidcsv EXPORT rapidcsvTargets)
+  install(EXPORT rapidcsvTargets
+          NAMESPACE rapidcsv::
+          DESTINATION cmake)
+
+  # Generate and install config files
+  configure_package_config_file(
+    ${CMAKE_CURRENT_SOURCE_DIR}/cmake/rapidcsvConfig.cmake.in
+    ${CMAKE_CURRENT_BINARY_DIR}/rapidcsvConfig.cmake
+    INSTALL_DESTINATION cmake
+  )
+  install(FILES ${CMAKE_CURRENT_BINARY_DIR}/rapidcsvConfig.cmake DESTINATION cmake)
+
   # Uninstall
-  add_custom_target(uninstall COMMAND "${CMAKE_COMMAND}" -E remove "${CMAKE_INSTALL_PREFIX}/include/rapidcsv.h"
-)
+  add_custom_target(uninstall
+    COMMAND "${CMAKE_COMMAND}" -E remove "${CMAKE_INSTALL_PREFIX}/include/rapidcsv.h"
+    COMMAND "${CMAKE_COMMAND}" -E remove "${CMAKE_INSTALL_PREFIX}/cmake/rapidcsvConfig.cmake"
+    COMMAND "${CMAKE_COMMAND}" -E remove "${CMAKE_INSTALL_PREFIX}/cmake/rapidcsvTargets.cmake"
+  )
 else()
   message(STATUS "Install/uninstall targets disabled.")
 endif()

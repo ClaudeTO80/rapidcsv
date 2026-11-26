@@ -15,7 +15,7 @@ int main()
         ",\n"
         ",\n"
         ","
-        ;
+      ;
 
       std::istringstream sstream(csv);
       rapidcsv::Document doc(sstream, rapidcsv::LabelParams(-1, -1));
@@ -34,7 +34,7 @@ int main()
         ",\n"
         ",\n"
         ",\n"
-        ;
+      ;
 
       std::istringstream sstream(csv);
       rapidcsv::Document doc(sstream, rapidcsv::LabelParams(-1, -1));
@@ -49,7 +49,7 @@ int main()
   }
   catch (const std::exception& ex)
   {
-    std::cout << ex.what() << std::endl;
+    std::cout << "exception: " << ex.what() << std::endl;
     rv = 1;
   }
 

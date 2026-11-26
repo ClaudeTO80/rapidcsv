@@ -1,4 +1,4 @@
-// test063.cpp - linebreaks in quoted text
+// test064.cpp - linebreaks in quoted text
 
 #include <rapidcsv.h>
 #include "unittest.h"
@@ -48,7 +48,7 @@ int main()
   }
   catch (const std::exception& ex)
   {
-    std::cout << ex.what() << std::endl;
+    std::cout << "exception: " << ex.what() << std::endl;
     rv = 1;
   }
 

@@ -47,10 +47,10 @@ The [tests](tests/) directory also contains many simple usage examples.
 Supported Platforms
 ===================
 Rapidcsv is implemented using C++11 with the intention of being portable. It's
-been tested on:
-- macOS Ventura 13.0
-- Ubuntu 22.04 LTS
-- Windows 10 / Visual Studio 2019
+tested on:
+- macOS Sonoma 14.7
+- Ubuntu 24.04 LTS
+- Windows Server / Visual Studio 2022
 
 Installation
 ============
@@ -354,12 +354,15 @@ Reading a File with Invalid Numbers (e.g. Empty Cells) as Numeric Data
 -----------------------------------------------------------------------
 By default rapidcsv throws an exception if one tries to access non-numeric
 data as a numeric data type, as it basically propagates the underlying
-conversion routines' exceptions to the calling application.
+conversion routines' exceptions to the calling application. Note that these
+routines (e.g. `std::stoi`) accept a numeric prefix, so `"12abc"` reads as
+`12`. For strict parsing, use a
+[custom converter](#custom-data-type-conversion-per-call) that checks that the
+whole cell was consumed.
 
-The reason for this is to ensure data correctness. If one wants to be able
-to read data with invalid numbers as numeric data types, one can use
-ConverterParams to configure the converter to default to a numeric value.
-The value is configurable and by default it's
+If one wants to be able to read data with invalid numbers as numeric data
+types, one can use ConverterParams to configure the converter to default to a
+numeric value. The value is configurable and by default it's
 std::numeric_limits<long double>::signaling_NaN() for float types, and 0 for
 integer types. Example:
 
@@ -422,18 +425,30 @@ rapidcsv::Document doc("file.csv", rapidcsv::LabelParams(), rapidcsv::SeparatorP
 UTF-16 and UTF-8
 ----------------
 Rapidcsv's preferred encoding for non-ASCII text is UTF-8. UTF-16 LE and
-UTF-16 BE can be read and written by rapidcsv on systems where codecvt header
-is present. Define HAS_CODECVT before including rapidcsv.h in order to enable
-the functionality. Rapidcsv unit tests automatically detects the presence of
-codecvt and sets HAS_CODECVT as needed, see [CMakeLists.txt](CMakeLists.txt)
-for reference. When enabled, the UTF-16 encoding of any loaded file is
-automatically detected.
+UTF-16 BE can also be read and written, using the byte order mark of a loaded
+file to automatically detect its encoding. Documents loaded as UTF-16 are
+converted to UTF-8 internally, and converted back to their original UTF-16
+encoding when saved.
 
-CMake FetchContent
-------------------
-Rapidcsv may be included in a CMake project using FetchContent. Refer to the
-[CMake FetchContent Example Project](examples/cmake-fetchcontent) and in
-particular its [CMakeLists.txt](examples/cmake-fetchcontent/CMakeLists.txt).
+Limiting Maximum Document Size
+------------------------------
+Rapidcsv does not limit the amount of data read by default. As each parsed cell
+has some memory overhead, malformed input may expand to much more memory than
+the size of the input data. Applications reading untrusted input may define
+RAPIDCSV_MAX_COUNT before including rapidcsv.h, in order to set an upper limit
+for the number of rows or columns read and throw exception `std::out_of_range`
+when exceeded.
+
+CMake
+-----
+Rapidcsv may be included in a CMake project using various methods:
+
+- Add Subdirectory: [Example Project](examples/cmake-add-subdirectory) /
+  [CMakeLists.txt](examples/cmake-add-subdirectory/CMakeLists.txt)
+- Fetch Content: [Example Project](examples/cmake-fetchcontent) /
+  [CMakeLists.txt](examples/cmake-fetchcontent/CMakeLists.txt)
+- Find Package: [Example Project](examples/cmake-find-package) /
+  [CMakeLists.txt](examples/cmake-find-package/CMakeLists.txt)
 
 Locale Independent Parsing
 --------------------------
@@ -478,6 +493,13 @@ License
 =======
 Rapidcsv is distributed under the BSD 3-Clause license. See
 [LICENSE](https://github.com/d99kris/rapidcsv/blob/master/LICENSE) file.
+
+Project Scope
+=============
+Rapidcsv is feature-complete and in maintenance mode. It aims to be an
+easy-to-use header-only CSV parser covering common use cases, rather than a
+full-featured CSV toolkit. Maintenance mainly means fixing bugs, portability
+issues and documentation.
 
 Contributions
 =============

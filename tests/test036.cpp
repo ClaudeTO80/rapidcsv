@@ -1,4 +1,4 @@
-// test036.cpp - supported datatypes
+// test036.cpp - get supported datatypes
 
 #include <rapidcsv.h>
 #include "unittest.h"
@@ -17,6 +17,10 @@ int main()
     "float,3.3E38\n"
     "double,1.6E308\n"
     "long double,1.6E308\n"
+    "signed char,-128\n"
+    "unsigned char,255\n"
+    "short,32767\n"
+    "unsigned short,65535\n"
   ;
 
   std::string path = unittest::TempPath();
@@ -42,10 +46,15 @@ int main()
 
     long double longdoubleval = doc.GetCell<long double>(1, 8);
     unittest::ExpectTrue((longdoubleval > 1.5E308) && (longdoubleval < 1.7E308));
+
+    unittest::ExpectEqual(signed char, doc.GetCell<signed char>(1, 9), -128);
+    unittest::ExpectEqual(unsigned char, doc.GetCell<unsigned char>(1, 10), 255);
+    unittest::ExpectEqual(short, doc.GetCell<short>(1, 11), 32767);
+    unittest::ExpectEqual(unsigned short, doc.GetCell<unsigned short>(1, 12), 65535);
   }
   catch (const std::exception& ex)
   {
-    std::cout << ex.what() << std::endl;
+    std::cout << "exception: " << ex.what() << std::endl;
     rv = 1;
   }
 
