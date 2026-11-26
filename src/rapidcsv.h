@@ -27,6 +27,7 @@
 #include <map>
 #include <sstream>
 #include <stdexcept>
+#include <streambuf>
 #include <string>
 #include <typeinfo>
 #include <vector>
@@ -87,6 +88,21 @@ namespace rapidcsv
      * @brief   specifies whether to honor LC_NUMERIC locale.
      */
     bool mNumericLocale;
+  };
+
+  /**
+   * @brief     Read-only std::streambuf viewing an existing string without copying it.
+   * @details   Used to parse UTF-8 text produced by a UTF-16 conversion. The buffer is only
+   *            read through the get area, so the const_cast does not modify the string.
+   */
+  class StringViewBuf : public std::streambuf
+  {
+  public:
+    explicit StringViewBuf(const std::string& pStr)
+    {
+      char* begin = const_cast<char*>(pStr.data());
+      setg(begin, begin, begin + pStr.size());
+    }
   };
 
   /**
@@ -1598,14 +1614,19 @@ namespace rapidcsv
         mIsUtf16 = true;
         mIsLE = (bom2b == bomU16le);
 
-        std::vector<char> buffer(static_cast<size_t>(length));
-        pStream.read(buffer.data(), length);
+        std::string utf8;
+        {
+          std::vector<char> buffer(static_cast<size_t>(length));
+          pStream.read(buffer.data(), length);
 
-        // skip byte order mark
-        const std::string utf8 = Utf16ToUtf8(buffer.data() + 2, static_cast<size_t>(length) - 2,
-                                             mIsLE);
-        std::stringstream ss(utf8);
-        ParseCsv(ss, static_cast<std::streamsize>(utf8.size()));
+          // skip byte order mark
+          utf8 = Utf16ToUtf8(buffer.data() + 2, static_cast<size_t>(length) - 2, mIsLE);
+        }  // raw UTF-16 buffer released here, before parsing
+
+        // parse the UTF-8 text in place, without a second copy in a stringstream
+        StringViewBuf view(utf8);
+        std::istream utf8Stream(&view);
+        ParseCsv(utf8Stream, static_cast<std::streamsize>(utf8.size()));
       }
       else
       {
@@ -1694,7 +1715,7 @@ namespace rapidcsv
             if (!quoted)
             {
               CheckMaxCount(row.size() + 1);
-              row.push_back(Unquote(Trim(cell)));
+              row.push_back(FinishCell(std::move(cell)));
               cell.clear();
             }
             else
@@ -1738,7 +1759,7 @@ namespace rapidcsv
               else
               {
                 CheckMaxCount(row.size() + 1);
-                row.push_back(Unquote(Trim(cell)));
+                row.push_back(FinishCell(std::move(cell)));
 
                 if (mLineReaderParams.mSkipCommentLines && !row.at(0).empty() &&
                     (row.at(0)[0] == mLineReaderParams.mCommentPrefix))
@@ -1748,7 +1769,7 @@ namespace rapidcsv
                 else
                 {
                   CheckMaxCount(mData.size() + 1);
-                  mData.push_back(row);
+                  StoreRecord(row);
                 }
 
                 cell.clear();
@@ -1780,7 +1801,7 @@ namespace rapidcsv
       else
       {
         CheckMaxCount(row.size() + 1);
-        row.push_back(Unquote(Trim(cell)));
+        row.push_back(FinishCell(std::move(cell)));
 
         if (mLineReaderParams.mSkipCommentLines && !row.at(0).empty() &&
             (row.at(0)[0] == mLineReaderParams.mCommentPrefix))
@@ -1790,7 +1811,7 @@ namespace rapidcsv
         else
         {
           CheckMaxCount(mData.size() + 1);
-          mData.push_back(row);
+          StoreRecord(row);
         }
 
         cell.clear();
@@ -1927,47 +1948,55 @@ namespace rapidcsv
       return row[dataColumnIdx];
     }
 
-    std::string Trim(const std::string& pStr) const
+    /**
+     * @brief   Trims and unquotes a raw cell, working in place on the moved-in string.
+     * @details Replaces the former Trim()/Unquote() pair, which copied the string at each step.
+     * @param   pStr                  raw cell content, taken by value so it can be moved from.
+     * @returns cell content after trimming and quote removal.
+     */
+    std::string FinishCell(std::string pStr) const
     {
       if (mSeparatorParams.mTrim)
       {
-        std::string str = pStr;
-
         // ltrim
-        str.erase(str.begin(), std::find_if(str.begin(), str.end(), [](unsigned char ch) { return !isspace(ch); }));
+        pStr.erase(pStr.begin(), std::find_if(pStr.begin(), pStr.end(),
+                                              [](unsigned char ch) { return !isspace(ch); }));
 
         // rtrim
-        str.erase(std::find_if(str.rbegin(), str.rend(), [](unsigned char ch) {
-          return !isspace(ch);
-        }).base(), str.end());
-
-        return str;
+        pStr.erase(std::find_if(pStr.rbegin(), pStr.rend(),
+                                [](unsigned char ch) { return !isspace(ch); }).base(), pStr.end());
       }
-      else
-      {
-        return pStr;
-      }
-    }
 
-    std::string Unquote(const std::string& pStr) const
-    {
       if (mSeparatorParams.mAutoQuote && (pStr.size() >= 2) &&
           (pStr.front() == mSeparatorParams.mQuoteChar) &&
           (pStr.back() == mSeparatorParams.mQuoteChar))
       {
         // remove start/end quotes
-        std::string str = pStr.substr(1, pStr.size() - 2);
+        pStr.pop_back();
+        pStr.erase(pStr.begin());
 
         // unescape quotes in string
-        const std::string quoteCharStr = std::string(1, mSeparatorParams.mQuoteChar);
-        ReplaceString(str, quoteCharStr + quoteCharStr, quoteCharStr);
+        const std::string quoteCharStr(1, mSeparatorParams.mQuoteChar);
+        ReplaceString(pStr, quoteCharStr + quoteCharStr, quoteCharStr);
+      }
 
-        return str;
-      }
-      else
-      {
-        return pStr;
-      }
+      // cells are built one character at a time, so their capacity can exceed their size
+      pStr.shrink_to_fit();
+      return pStr;
+    }
+
+    /**
+     * @brief   Moves a completed record into the document.
+     * @details Leaves pRow empty and reserved to the width of the record just stored, so the
+     *          next record is built without repeated reallocation.
+     * @param   pRow                  record to store; empty on return.
+     */
+    void StoreRecord(std::vector<std::string>& pRow)
+    {
+      const size_t width = pRow.size();
+      mData.push_back(std::move(pRow));
+      pRow.clear();
+      pRow.reserve(width);
     }
 
     void UpdateColumnNames()
