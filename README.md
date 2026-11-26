@@ -430,6 +430,77 @@ file to automatically detect its encoding. Documents loaded as UTF-16 are
 converted to UTF-8 internally, and converted back to their original UTF-16
 encoding when saved.
 
+Storage Modes and Performance
+-----------------------------
+Cells are kept in a flat table. The `StorageMode` argument, which defaults to
+`StorageMode::Editable`, selects one of two layouts when a document is loaded:
+
+- `StorageMode::Editable`: each row keeps its own buffer and cell end offsets.
+  All modifying methods (`SetCell`, `InsertRow`, `RemoveColumn`, ...) work.
+- `StorageMode::ReadOnly`: all cells share one contiguous arena with offsets.
+  Any modifying method throws `std::logic_error`. Reading and saving give the
+  same results as in `Editable` mode.
+
+```cpp
+rapidcsv::Document doc("file.csv", rapidcsv::LabelParams(), rapidcsv::SeparatorParams(),
+                       rapidcsv::ConverterParams(), rapidcsv::LineReaderParams(),
+                       rapidcsv::StorageMode::ReadOnly);
+```
+
+Use `ReadOnly` for data that is only read and written back unchanged. Use
+`Editable` when the data is modified after loading.
+
+### Measurements
+
+Input: a generated file of 2,000,000 rows and 8 columns (92.6 MB of cell text),
+with quoted fields containing separators and spaces, numeric counts and an
+empty column. The generator is not part of this repository.
+
+Build and machine: g++ 13.3.0, `-std=c++11 -O2`, Linux, 2 vCPU, 8 GB RAM.
+Each configuration was run twice; run-to-run noise is about 10%.
+
+| Version              | Load          | Read every cell | Save          | Memory after load |
+|----------------------|---------------|-----------------|---------------|-------------------|
+| Original rapidcsv    | 1.32–1.37 s   | 0.25–0.29 s     | 0.97–1.05 s   | 645 MB            |
+| `Editable`           | 1.46–1.53 s   | 0.30–0.32 s     | 0.81 s        | 326 MB (−49%)     |
+| `ReadOnly`           | 1.22–1.26 s   | 0.27 s          | 0.71–0.72 s   | 254 MB (−61%)     |
+
+"Read every cell" calls `GetCell<std::string>` for each cell. "Save" writes to
+`/dev/null`.
+
+In these runs `ReadOnly` loads and reads at about the same speed as the original
+and saves about 30% faster. `Editable` saves about 20% faster, reads 10–25%
+slower and loads about 10% slower. Both modes use about half the memory or
+less.
+
+### Checks
+
+- Unit tests: 118 CTest tests pass in the Debug build.
+- Sanitizers: the same 118 tests pass under AddressSanitizer and
+  UndefinedBehaviorSanitizer, with no reports.
+- Warnings: the Debug build with the project's warning flags (including
+  `-Weffc++`) produces no warnings. The Release build also compiles without
+  warnings, but the unit tests are only registered in Debug builds, so Release
+  was checked for compilation only.
+- Output: `Save` output is byte-identical to the original library's output on
+  the 2,000,000-row file (same SHA-256), on the UTF-16 files and on the edge-case
+  files that the original accepts. `Editable` and `ReadOnly` give the same
+  results on all of these files.
+
+Not covered by these checks: MSVC, Clang, macOS and Windows builds; datasets
+other than the generated file and the test files in the repository; and the
+performance test targets (`ptest*`), which were not run for these measurements.
+
+### Behavior changes
+
+Two changes in the parser are deliberate and differ from the original library:
+
+- A quoted field that is never closed throws `std::runtime_error`, and the
+  message names the record.
+- A line break inside a quoted field throws the same error unless
+  `pQuotedLinebreaks` is set in `SeparatorParams`. The original library accepted
+  such input silently.
+
 Limiting Maximum Document Size
 ------------------------------
 Rapidcsv does not limit the amount of data read by default. As each parsed cell
