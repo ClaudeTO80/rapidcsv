@@ -29,6 +29,7 @@
 #include <stdexcept>
 #include <streambuf>
 #include <string>
+#include <type_traits>
 #include <typeinfo>
 #include <vector>
 
@@ -497,6 +498,430 @@ namespace rapidcsv
   };
 
   /**
+   * @brief     Selects how the cells of a Document are stored; chosen when data is loaded.
+   */
+  enum class StorageMode
+  {
+    Editable,   //!< rows can be inserted, removed and changed (default)
+    ReadOnly    //!< cells are stored compactly, and any change throws std::logic_error
+  };
+
+  /**
+   * @brief     Cell storage of a Document, in one of two representations.
+   * @details   Editable: each row keeps its cells in one buffer, with the end offset of each
+   *            cell, so single rows can be inserted, removed and rewritten cheaply.
+   *            Read-only: all cells share one buffer, with the end offset of each cell and the
+   *            cumulative cell count of each row. It uses less memory and reads faster, but
+   *            cannot be changed.
+   *            Offsets are 32-bit: a row (editable) or the whole table (read-only) is limited
+   *            to 4 GiB of cell text.
+   */
+  class CellTable
+  {
+  public:
+    CellTable()
+      : mReadOnly(false)
+      , mRows()
+      , mArena()
+      , mCellEnds()
+      , mRowEnds()
+      , mPending()
+      , mPendingArenaStart(0)
+      , mPendingCellStart(0)
+    {
+    }
+
+    /**
+     * @brief   Empties the table and selects its representation.
+     * @param   pReadOnly             true for the read-only representation.
+     */
+    void Reset(const bool pReadOnly)
+    {
+      mReadOnly = pReadOnly;
+      Clear();
+    }
+
+    /**
+     * @brief   Removes all rows, keeping the representation.
+     */
+    void Clear()
+    {
+      mRows.clear();
+      mArena.clear();
+      mCellEnds.clear();
+      mRowEnds.clear();
+      mPending.chars.clear();
+      mPending.ends.clear();
+    }
+
+    bool IsReadOnly() const
+    {
+      return mReadOnly;
+    }
+
+    size_t RowCount() const
+    {
+      return mReadOnly ? mRowEnds.size() : mRows.size();
+    }
+
+    size_t RowWidth(const size_t pRow) const
+    {
+      CheckRow(pRow);
+      if (mReadOnly)
+      {
+        return mRowEnds[pRow] - RowFirstCell(pRow);
+      }
+      return mRows[pRow].ends.size();
+    }
+
+    /**
+     * @brief   Returns the content of one cell. The indices must be valid.
+     */
+    std::string Get(const size_t pRow, const size_t pCol) const
+    {
+      CheckCell(pRow, pCol);
+      if (mReadOnly)
+      {
+        const size_t cell = RowFirstCell(pRow) + pCol;
+        const size_t begin = (cell == 0) ? 0 : mCellEnds[cell - 1];
+        return mArena.substr(begin, mCellEnds[cell] - begin);
+      }
+
+      const RowBuf& row = mRows[pRow];
+      const size_t begin = (pCol == 0) ? 0 : row.ends[pCol - 1];
+      return row.chars.substr(begin, row.ends[pCol] - begin);
+    }
+
+    /**
+     * @brief   Copies the content of one cell into pOut, reusing its buffer.
+     * @details Unlike Get(), performs no bounds check: the indices must be valid. Avoids the
+     *          temporary string that Get() returns by value.
+     * @param   pRow                  row index, valid
+     * @param   pCol                  column index within the row, valid
+     * @param   pOut                  destination string, overwritten
+     */
+    void CopyCell(const size_t pRow, const size_t pCol, std::string& pOut) const
+    {
+      if (mReadOnly)
+      {
+        const size_t cell = RowFirstCell(pRow) + pCol;
+        const size_t begin = (cell == 0) ? 0 : mCellEnds[cell - 1];
+        pOut.assign(mArena, begin, mCellEnds[cell] - begin);
+        return;
+      }
+
+      const RowBuf& row = mRows[pRow];
+      const size_t begin = (pCol == 0) ? 0 : row.ends[pCol - 1];
+      pOut.assign(row.chars, begin, row.ends[pCol] - begin);
+    }
+
+    /**
+     * @brief   Returns the content of all cells of one row.
+     */
+    std::vector<std::string> GetRow(const size_t pRow) const
+    {
+      const size_t width = RowWidth(pRow);
+      std::vector<std::string> cells;
+      cells.reserve(width);
+      for (size_t c = 0; c < width; ++c)
+      {
+        cells.push_back(Get(pRow, c));
+      }
+      return cells;
+    }
+
+    // The following members change the table and throw std::logic_error when it is read-only.
+
+    /**
+     * @brief   Throws std::logic_error if the table is read-only. Call before changing a
+     *          Document, so that a failed change does not leave partial state behind.
+     */
+    void RequireEditable() const
+    {
+      if (mReadOnly)
+      {
+        throw std::logic_error("document was loaded as read-only (StorageMode::ReadOnly)");
+      }
+    }
+
+    /**
+     * @brief   Replaces the content of one existing cell.
+     */
+    void Set(const size_t pRow, const size_t pCol, const std::string& pVal)
+    {
+      RequireEditable();
+      CheckCell(pRow, pCol);
+      RowBuf& row = mRows[pRow];
+      const size_t begin = (pCol == 0) ? 0 : row.ends[pCol - 1];
+      const size_t oldSize = row.ends[pCol] - begin;
+      CheckOffset(row.chars.size() - oldSize + pVal.size());
+
+      row.chars.replace(begin, oldSize, pVal);
+      for (size_t c = pCol; c < row.ends.size(); ++c)
+      {
+        row.ends[c] = static_cast<uint32_t>(row.ends[c] + pVal.size() - oldSize);
+      }
+    }
+
+    /**
+     * @brief   Truncates or extends a row with empty cells to the given width.
+     */
+    void ResizeRow(const size_t pRow, const size_t pWidth)
+    {
+      RequireEditable();
+      CheckRow(pRow);
+      RowBuf& row = mRows[pRow];
+      if (pWidth < row.ends.size())
+      {
+        const size_t keep = (pWidth == 0) ? 0 : row.ends[pWidth - 1];
+        row.chars.resize(keep);
+        row.ends.resize(pWidth);
+      }
+      else
+      {
+        row.ends.resize(pWidth, static_cast<uint32_t>(row.chars.size()));
+      }
+    }
+
+    /**
+     * @brief   Replaces all cells of one existing row.
+     */
+    void SetRow(const size_t pRow, const std::vector<std::string>& pCells)
+    {
+      RequireEditable();
+      CheckRow(pRow);
+      Assign(mRows[pRow], pCells);
+    }
+
+    void InsertRow(const size_t pRow, const std::vector<std::string>& pCells)
+    {
+      RequireEditable();
+      if (pRow > mRows.size())
+      {
+        throw std::out_of_range("row index " + std::to_string(pRow) + " out of range (rows: " +
+                                std::to_string(mRows.size()) + ")");
+      }
+      RowBuf row;
+      Assign(row, pCells);
+      mRows.insert(mRows.begin() + static_cast<std::ptrdiff_t>(pRow), std::move(row));
+    }
+
+    void AppendRow(const std::vector<std::string>& pCells)
+    {
+      RequireEditable();
+      RowBuf row;
+      Assign(row, pCells);
+      mRows.push_back(std::move(row));
+    }
+
+    void EraseRow(const size_t pRow)
+    {
+      RequireEditable();
+      CheckRow(pRow);
+      mRows.erase(mRows.begin() + static_cast<std::ptrdiff_t>(pRow));
+    }
+
+    /**
+     * @brief   Inserts one cell before the cell at pCol (pCol may equal the row width).
+     */
+    void InsertCell(const size_t pRow, const size_t pCol, const std::string& pVal)
+    {
+      RequireEditable();
+      CheckRow(pRow);
+      RowBuf& row = mRows[pRow];
+      if (pCol > row.ends.size())
+      {
+        throw std::out_of_range("column index " + std::to_string(pCol) + " out of range for row " +
+                                std::to_string(pRow) + " (row has " + std::to_string(row.ends.size()) + " cells)");
+      }
+
+      const size_t begin = (pCol == 0) ? 0 : row.ends[pCol - 1];
+      CheckOffset(row.chars.size() + pVal.size());
+      row.chars.insert(begin, pVal);
+      for (size_t c = pCol; c < row.ends.size(); ++c)
+      {
+        row.ends[c] = static_cast<uint32_t>(row.ends[c] + pVal.size());
+      }
+      row.ends.insert(row.ends.begin() + static_cast<std::ptrdiff_t>(pCol),
+                      static_cast<uint32_t>(begin + pVal.size()));
+    }
+
+    /**
+     * @brief   Removes the cell at pCol.
+     */
+    void EraseCell(const size_t pRow, const size_t pCol)
+    {
+      RequireEditable();
+      CheckCell(pRow, pCol);
+      RowBuf& row = mRows[pRow];
+      const size_t begin = (pCol == 0) ? 0 : row.ends[pCol - 1];
+      const size_t size = row.ends[pCol] - begin;
+      row.chars.erase(begin, size);
+      row.ends.erase(row.ends.begin() + static_cast<std::ptrdiff_t>(pCol));
+      for (size_t c = pCol; c < row.ends.size(); ++c)
+      {
+        row.ends[c] = static_cast<uint32_t>(row.ends[c] - size);
+      }
+    }
+
+    // Loading: rows are built cell by cell by the parser. These are allowed in both representations.
+
+    /**
+     * @brief   Starts a new row. Cells are added with AppendCell until EndRow or DiscardRow.
+     */
+    void BeginRow()
+    {
+      if (mReadOnly)
+      {
+        mPendingArenaStart = mArena.size();
+        mPendingCellStart = mCellEnds.size();
+      }
+      else
+      {
+        mPending.chars.clear();
+        mPending.ends.clear();
+      }
+    }
+
+    void AppendCell(const std::string& pVal)
+    {
+      if (mReadOnly)
+      {
+        CheckOffset(mArena.size() + pVal.size());
+        mArena += pVal;
+        mCellEnds.push_back(static_cast<uint32_t>(mArena.size()));
+      }
+      else
+      {
+        CheckOffset(mPending.chars.size() + pVal.size());
+        mPending.chars += pVal;
+        mPending.ends.push_back(static_cast<uint32_t>(mPending.chars.size()));
+      }
+    }
+
+    /**
+     * @brief   Number of cells appended to the row started by the last BeginRow.
+     */
+    size_t PendingCellCount() const
+    {
+      return mReadOnly ? (mCellEnds.size() - mPendingCellStart) : mPending.ends.size();
+    }
+
+    void EndRow()
+    {
+      if (mReadOnly)
+      {
+        CheckOffset(mCellEnds.size());
+        mRowEnds.push_back(static_cast<uint32_t>(mCellEnds.size()));
+      }
+      else
+      {
+        const size_t width = mPending.ends.size();
+        mPending.chars.shrink_to_fit();
+        mRows.push_back(std::move(mPending));
+        mPending = RowBuf();
+        mPending.ends.reserve(width);
+      }
+    }
+
+    /**
+     * @brief   Drops the cells of the row started by the last BeginRow.
+     */
+    void DiscardRow()
+    {
+      if (mReadOnly)
+      {
+        mArena.resize(mPendingArenaStart);
+        mCellEnds.resize(mPendingCellStart);
+      }
+      else
+      {
+        mPending.chars.clear();
+        mPending.ends.clear();
+      }
+    }
+
+    /**
+     * @brief   Releases spare capacity once loading is complete.
+     */
+    void ShrinkToFit()
+    {
+      mArena.shrink_to_fit();
+      mCellEnds.shrink_to_fit();
+      mRowEnds.shrink_to_fit();
+    }
+
+  private:
+    struct RowBuf
+    {
+      RowBuf() : chars(), ends() {}
+      std::string chars;             // cell contents, back to back
+      std::vector<uint32_t> ends;    // end offset in chars of each cell
+    };
+
+    void CheckRow(const size_t pRow) const
+    {
+      if (pRow >= RowCount())
+      {
+        throw std::out_of_range("row index " + std::to_string(pRow) + " out of range (rows: " +
+                                std::to_string(RowCount()) + ")");
+      }
+    }
+
+    void CheckCell(const size_t pRow, const size_t pCol) const
+    {
+      const size_t width = RowWidth(pRow);
+      if (pCol >= width)
+      {
+        throw std::out_of_range("column index " + std::to_string(pCol) + " out of range for row " +
+                                std::to_string(pRow) + " (row has " + std::to_string(width) + " cells)");
+      }
+    }
+
+    size_t RowFirstCell(const size_t pRow) const
+    {
+      return (pRow == 0) ? 0 : mRowEnds[pRow - 1];
+    }
+
+    static void CheckOffset(const size_t pSize)
+    {
+      if (pSize > static_cast<size_t>(std::numeric_limits<uint32_t>::max()))
+      {
+        throw std::length_error("cell data exceeds the 4 GiB limit of the table storage");
+      }
+    }
+
+    static void Assign(RowBuf& pRow, const std::vector<std::string>& pCells)
+    {
+      size_t total = 0;
+      for (const std::string& cell : pCells)
+      {
+        total += cell.size();
+      }
+      CheckOffset(total);
+
+      pRow.chars.clear();
+      pRow.ends.clear();
+      pRow.chars.reserve(total);
+      pRow.ends.reserve(pCells.size());
+      for (const std::string& cell : pCells)
+      {
+        pRow.chars += cell;
+        pRow.ends.push_back(static_cast<uint32_t>(pRow.chars.size()));
+      }
+    }
+
+    bool mReadOnly;
+    std::vector<RowBuf> mRows;          // editable representation
+    std::string mArena;                 // read-only representation: all cell text
+    std::vector<uint32_t> mCellEnds;    // read-only: end offset in mArena of each cell
+    std::vector<uint32_t> mRowEnds;     // read-only: cumulative cell count after each row
+    RowBuf mPending;                    // editable: row being loaded
+    size_t mPendingArenaStart;          // read-only: arena size when the row being loaded began
+    size_t mPendingCellStart;           // read-only: cell count when the row being loaded began
+  };
+
+  /**
    * @brief     Class representing a CSV document.
    */
   class Document
@@ -516,7 +941,8 @@ namespace rapidcsv
                       const LabelParams& pLabelParams = LabelParams(),
                       const SeparatorParams& pSeparatorParams = SeparatorParams(),
                       const ConverterParams& pConverterParams = ConverterParams(),
-                      const LineReaderParams& pLineReaderParams = LineReaderParams())
+                      const LineReaderParams& pLineReaderParams = LineReaderParams(),
+                      const StorageMode pStorageMode = StorageMode::Editable)
       : mPath(pPath)
       , mLabelParams(pLabelParams)
       , mSeparatorParams(pSeparatorParams)
@@ -528,7 +954,7 @@ namespace rapidcsv
     {
       if (!mPath.empty())
       {
-        ReadCsv();
+        ReadCsv(pStorageMode == StorageMode::ReadOnly);
       }
     }
 
@@ -545,7 +971,8 @@ namespace rapidcsv
                       const LabelParams& pLabelParams = LabelParams(),
                       const SeparatorParams& pSeparatorParams = SeparatorParams(),
                       const ConverterParams& pConverterParams = ConverterParams(),
-                      const LineReaderParams& pLineReaderParams = LineReaderParams())
+                      const LineReaderParams& pLineReaderParams = LineReaderParams(),
+                      const StorageMode pStorageMode = StorageMode::Editable)
       : mPath()
       , mLabelParams(pLabelParams)
       , mSeparatorParams(pSeparatorParams)
@@ -555,7 +982,7 @@ namespace rapidcsv
       , mColumnNames()
       , mRowNames()
     {
-      ReadCsv(pStream);
+      ReadCsv(pStream, pStorageMode == StorageMode::ReadOnly);
     }
 
     /**
@@ -572,14 +999,15 @@ namespace rapidcsv
               const LabelParams& pLabelParams = LabelParams(),
               const SeparatorParams& pSeparatorParams = SeparatorParams(),
               const ConverterParams& pConverterParams = ConverterParams(),
-              const LineReaderParams& pLineReaderParams = LineReaderParams())
+              const LineReaderParams& pLineReaderParams = LineReaderParams(),
+              const StorageMode pStorageMode = StorageMode::Editable)
     {
       mPath = pPath;
       mLabelParams = pLabelParams;
       mSeparatorParams = pSeparatorParams;
       mConverterParams = pConverterParams;
       mLineReaderParams = pLineReaderParams;
-      ReadCsv();
+      ReadCsv(pStorageMode == StorageMode::ReadOnly);
     }
 
     /**
@@ -595,14 +1023,15 @@ namespace rapidcsv
               const LabelParams& pLabelParams = LabelParams(),
               const SeparatorParams& pSeparatorParams = SeparatorParams(),
               const ConverterParams& pConverterParams = ConverterParams(),
-              const LineReaderParams& pLineReaderParams = LineReaderParams())
+              const LineReaderParams& pLineReaderParams = LineReaderParams(),
+              const StorageMode pStorageMode = StorageMode::Editable)
     {
       mPath = "";
       mLabelParams = pLabelParams;
       mSeparatorParams = pSeparatorParams;
       mConverterParams = pConverterParams;
       mLineReaderParams = pLineReaderParams;
-      ReadCsv(pStream);
+      ReadCsv(pStream, pStorageMode == StorageMode::ReadOnly);
     }
 
     /**
@@ -635,7 +1064,7 @@ namespace rapidcsv
      */
     void Clear()
     {
-      mData.clear();
+      mData.Clear();
       mColumnNames.clear();
       mRowNames.clear();
       mIsUtf16 = false;
@@ -673,23 +1102,24 @@ namespace rapidcsv
       const size_t dataColumnIdx = GetDataColumnIndex(pColumnIdx);
       std::vector<T> column;
       Converter<T> converter(mConverterParams);
-      for (auto itRow = mData.begin(); itRow != mData.end(); ++itRow)
+      for (size_t dataRowIdx = 0; dataRowIdx < mData.RowCount(); ++dataRowIdx)
       {
-        if (std::distance(mData.begin(), itRow) > mLabelParams.mColumnNameIdx)
+        if (static_cast<std::ptrdiff_t>(dataRowIdx) > mLabelParams.mColumnNameIdx)
         {
-          if (dataColumnIdx < itRow->size())
+          const size_t width = mData.RowWidth(dataRowIdx);
+          if (dataColumnIdx < width)
           {
             T val;
-            converter.ToVal(itRow->at(dataColumnIdx), val);
+            converter.ToVal(mData.Get(dataRowIdx, dataColumnIdx), val);
             column.push_back(val);
           }
           else
           {
             const std::string errStr = "requested column index " +
               std::to_string(pColumnIdx) + " >= " +
-              std::to_string(itRow->size() - GetDataColumnIndex(0)) +
+              std::to_string(width - GetDataColumnIndex(0)) +
               " (number of columns on row index " +
-              std::to_string(std::distance(mData.begin(), itRow) -
+              std::to_string(static_cast<std::ptrdiff_t>(dataRowIdx) -
                              (mLabelParams.mColumnNameIdx + 1)) + ")";
             throw std::out_of_range(errStr);
           }
@@ -709,12 +1139,12 @@ namespace rapidcsv
     {
       const size_t dataColumnIdx = GetDataColumnIndex(pColumnIdx);
       std::vector<T> column;
-      for (auto itRow = mData.begin(); itRow != mData.end(); ++itRow)
+      for (size_t dataRowIdx = 0; dataRowIdx < mData.RowCount(); ++dataRowIdx)
       {
-        if (std::distance(mData.begin(), itRow) > mLabelParams.mColumnNameIdx)
+        if (static_cast<std::ptrdiff_t>(dataRowIdx) > mLabelParams.mColumnNameIdx)
         {
           T val;
-          pToVal(itRow->at(dataColumnIdx), val);
+          pToVal(mData.Get(dataRowIdx, dataColumnIdx), val);
           column.push_back(val);
         }
       }
@@ -762,36 +1192,34 @@ namespace rapidcsv
     template<typename T>
     void SetColumn(const size_t pColumnIdx, const std::vector<T>& pColumn)
     {
+      mData.RequireEditable();
       const size_t dataColumnIdx = GetDataColumnIndex(pColumnIdx);
 
       while (GetDataRowIndex(pColumn.size()) > GetDataRowCount())
       {
-        std::vector<std::string> row;
-        row.resize(GetDataColumnCount());
-        mData.push_back(row);
+        mData.AppendRow(std::vector<std::string>(GetDataColumnCount()));
       }
 
       if ((dataColumnIdx + 1) > GetDataColumnCount())
       {
-        for (auto itRow = mData.begin(); itRow != mData.end(); ++itRow)
+        for (size_t dataRowIdx = 0; dataRowIdx < mData.RowCount(); ++dataRowIdx)
         {
-          if (std::distance(mData.begin(), itRow) >= mLabelParams.mColumnNameIdx)
+          if (static_cast<std::ptrdiff_t>(dataRowIdx) >= mLabelParams.mColumnNameIdx)
           {
-            if (itRow->size() < (dataColumnIdx + 1))
+            if (mData.RowWidth(dataRowIdx) < (dataColumnIdx + 1))
             {
-              itRow->resize(dataColumnIdx + 1);
+              mData.ResizeRow(dataRowIdx, dataColumnIdx + 1);
             }
           }
         }
       }
 
       Converter<T> converter(mConverterParams);
-      for (auto itRow = pColumn.begin(); itRow != pColumn.end(); ++itRow)
+      for (size_t i = 0; i < pColumn.size(); ++i)
       {
         std::string str;
-        converter.ToStr(*itRow, str);
-        mData.at(static_cast<size_t>(std::distance(pColumn.begin(), itRow) + mLabelParams.mColumnNameIdx + 1)).at(
-          dataColumnIdx) = str;
+        converter.ToStr(pColumn[i], str);
+        mData.Set(i + static_cast<size_t>(mLabelParams.mColumnNameIdx + 1), dataColumnIdx, str);
       }
     }
 
@@ -817,20 +1245,21 @@ namespace rapidcsv
      */
     void RemoveColumn(const size_t pColumnIdx)
     {
+      mData.RequireEditable();
       const size_t dataColumnIdx = GetDataColumnIndex(pColumnIdx);
-      for (auto itRow = mData.begin(); itRow != mData.end(); ++itRow)
+      for (size_t dataRowIdx = 0; dataRowIdx < mData.RowCount(); ++dataRowIdx)
       {
-        if (std::distance(mData.begin(), itRow) >= mLabelParams.mColumnNameIdx)
+        if (static_cast<std::ptrdiff_t>(dataRowIdx) >= mLabelParams.mColumnNameIdx)
         {
-          if (dataColumnIdx < itRow->size())
+          if (dataColumnIdx < mData.RowWidth(dataRowIdx))
           {
-            itRow->erase(itRow->begin() + static_cast<std::ptrdiff_t>(dataColumnIdx));
+            mData.EraseCell(dataRowIdx, dataColumnIdx);
           }
           else
           {
             const std::string errStr = "column out of range: " +
               std::to_string(pColumnIdx) + " (on row " +
-              std::to_string(std::distance(mData.begin(), itRow)) +
+              std::to_string(dataRowIdx) +
               ")";
             throw std::out_of_range(errStr);
           }
@@ -865,6 +1294,7 @@ namespace rapidcsv
     void InsertColumn(const size_t pColumnIdx, const std::vector<T>& pColumn = std::vector<T>(),
                       const std::string& pColumnName = std::string())
     {
+      mData.RequireEditable();
       const size_t dataColumnIdx = GetDataColumnIndex(pColumnIdx);
 
       std::vector<std::string> column;
@@ -876,39 +1306,35 @@ namespace rapidcsv
       {
         column.resize(GetDataRowIndex(pColumn.size()));
         Converter<T> converter(mConverterParams);
-        for (auto itRow = pColumn.begin(); itRow != pColumn.end(); ++itRow)
+        for (size_t i = 0; i < pColumn.size(); ++i)
         {
           std::string str;
-          converter.ToStr(*itRow, str);
-          const size_t rowIdx =
-            static_cast<size_t>(std::distance(pColumn.begin(), itRow) + (mLabelParams.mColumnNameIdx + 1));
+          converter.ToStr(pColumn[i], str);
+          const size_t rowIdx = i + static_cast<size_t>(mLabelParams.mColumnNameIdx + 1);
           column.at(rowIdx) = str;
         }
       }
 
       while (column.size() > GetDataRowCount())
       {
-        std::vector<std::string> row;
         const size_t columnCount = std::max<size_t>(static_cast<size_t>(mLabelParams.mColumnNameIdx + 1),
                                                     GetDataColumnCount());
-        row.resize(columnCount);
-        mData.push_back(row);
+        mData.AppendRow(std::vector<std::string>(columnCount));
       }
 
-      for (auto itRow = mData.begin(); itRow != mData.end(); ++itRow)
+      for (size_t dataRowIdx = 0; dataRowIdx < mData.RowCount(); ++dataRowIdx)
       {
-        if (std::distance(mData.begin(), itRow) >= mLabelParams.mColumnNameIdx)
+        if (static_cast<std::ptrdiff_t>(dataRowIdx) >= mLabelParams.mColumnNameIdx)
         {
-          const size_t rowIdx = static_cast<size_t>(std::distance(mData.begin(), itRow));
-          if (dataColumnIdx <= itRow->size())
+          if (dataColumnIdx <= mData.RowWidth(dataRowIdx))
           {
-            itRow->insert(itRow->begin() + static_cast<std::ptrdiff_t>(dataColumnIdx), column.at(rowIdx));
+            mData.InsertCell(dataRowIdx, dataColumnIdx, column.at(dataRowIdx));
           }
           else
           {
             const std::string errStr = "column out of range: " +
               std::to_string(pColumnIdx) + " (on row " +
-              std::to_string(std::distance(mData.begin(), itRow)) +
+              std::to_string(dataRowIdx) +
               ")";
             throw std::out_of_range(errStr);
           }
@@ -931,7 +1357,7 @@ namespace rapidcsv
     {
       const size_t firstRow = static_cast<size_t>((mLabelParams.mColumnNameIdx >= 0) ? mLabelParams.mColumnNameIdx : 0);
       const std::ptrdiff_t count =
-        static_cast<std::ptrdiff_t>((mData.size() > firstRow) ? mData.at(firstRow).size() : 0) -
+        static_cast<std::ptrdiff_t>((mData.RowCount() > firstRow) ? mData.RowWidth(firstRow) : 0) -
         (mLabelParams.mRowNameIdx + 1);
       return (count >= 0) ? static_cast<size_t>(count) : 0;
     }
@@ -966,12 +1392,13 @@ namespace rapidcsv
       const size_t dataRowIdx = GetDataRowIndex(pRowIdx);
       std::vector<T> row;
       Converter<T> converter(mConverterParams);
-      for (auto itCol = mData.at(dataRowIdx).begin(); itCol != mData.at(dataRowIdx).end(); ++itCol)
+      const size_t width = mData.RowWidth(dataRowIdx);
+      for (size_t dataColumnIdx = 0; dataColumnIdx < width; ++dataColumnIdx)
       {
-        if (std::distance(mData.at(dataRowIdx).begin(), itCol) > mLabelParams.mRowNameIdx)
+        if (static_cast<std::ptrdiff_t>(dataColumnIdx) > mLabelParams.mRowNameIdx)
         {
           T val;
-          converter.ToVal(*itCol, val);
+          converter.ToVal(mData.Get(dataRowIdx, dataColumnIdx), val);
           row.push_back(val);
         }
       }
@@ -989,13 +1416,13 @@ namespace rapidcsv
     {
       const size_t dataRowIdx = GetDataRowIndex(pRowIdx);
       std::vector<T> row;
-      Converter<T> converter(mConverterParams);
-      for (auto itCol = mData.at(dataRowIdx).begin(); itCol != mData.at(dataRowIdx).end(); ++itCol)
+      const size_t width = mData.RowWidth(dataRowIdx);
+      for (size_t dataColumnIdx = 0; dataColumnIdx < width; ++dataColumnIdx)
       {
-        if (std::distance(mData.at(dataRowIdx).begin(), itCol) > mLabelParams.mRowNameIdx)
+        if (static_cast<std::ptrdiff_t>(dataColumnIdx) > mLabelParams.mRowNameIdx)
         {
           T val;
-          pToVal(*itCol, val);
+          pToVal(mData.Get(dataRowIdx, dataColumnIdx), val);
           row.push_back(val);
         }
       }
@@ -1043,36 +1470,34 @@ namespace rapidcsv
     template<typename T>
     void SetRow(const size_t pRowIdx, const std::vector<T>& pRow)
     {
+      mData.RequireEditable();
       const size_t dataRowIdx = GetDataRowIndex(pRowIdx);
 
       while ((dataRowIdx + 1) > GetDataRowCount())
       {
-        std::vector<std::string> row;
-        row.resize(GetDataColumnCount());
-        mData.push_back(row);
+        mData.AppendRow(std::vector<std::string>(GetDataColumnCount()));
       }
 
       if (GetDataColumnIndex(pRow.size()) > GetDataColumnCount())
       {
-        for (auto itRow = mData.begin(); itRow != mData.end(); ++itRow)
+        for (size_t r = 0; r < mData.RowCount(); ++r)
         {
-          if (std::distance(mData.begin(), itRow) >= mLabelParams.mColumnNameIdx)
+          if (static_cast<std::ptrdiff_t>(r) >= mLabelParams.mColumnNameIdx)
           {
-            if (itRow->size() < GetDataColumnIndex(pRow.size()))
+            if (mData.RowWidth(r) < GetDataColumnIndex(pRow.size()))
             {
-              itRow->resize(GetDataColumnIndex(pRow.size()));
+              mData.ResizeRow(r, GetDataColumnIndex(pRow.size()));
             }
           }
         }
       }
 
       Converter<T> converter(mConverterParams);
-      for (auto itCol = pRow.begin(); itCol != pRow.end(); ++itCol)
+      for (size_t i = 0; i < pRow.size(); ++i)
       {
         std::string str;
-        converter.ToStr(*itCol, str);
-        mData.at(dataRowIdx).at(static_cast<size_t>(std::distance(pRow.begin(),
-                                                                  itCol) + mLabelParams.mRowNameIdx + 1)) = str;
+        converter.ToStr(pRow[i], str);
+        mData.Set(dataRowIdx, i + static_cast<size_t>(mLabelParams.mRowNameIdx + 1), str);
       }
     }
 
@@ -1098,10 +1523,11 @@ namespace rapidcsv
      */
     void RemoveRow(const size_t pRowIdx)
     {
+      mData.RequireEditable();
       const size_t dataRowIdx = GetDataRowIndex(pRowIdx);
-      if (dataRowIdx < mData.size())
+      if (dataRowIdx < mData.RowCount())
       {
-        mData.erase(mData.begin() + static_cast<std::ptrdiff_t>(dataRowIdx));
+        mData.EraseRow(dataRowIdx);
       }
       else
       {
@@ -1138,6 +1564,7 @@ namespace rapidcsv
     void InsertRow(const size_t pRowIdx, const std::vector<T>& pRow = std::vector<T>(),
                    const std::string& pRowName = std::string())
     {
+      mData.RequireEditable();
       const size_t rowIdx = GetDataRowIndex(pRowIdx);
 
       std::vector<std::string> row;
@@ -1149,22 +1576,20 @@ namespace rapidcsv
       {
         row.resize(GetDataColumnIndex(pRow.size()));
         Converter<T> converter(mConverterParams);
-        for (auto itCol = pRow.begin(); itCol != pRow.end(); ++itCol)
+        for (size_t i = 0; i < pRow.size(); ++i)
         {
           std::string str;
-          converter.ToStr(*itCol, str);
-          row.at(static_cast<size_t>(std::distance(pRow.begin(), itCol) + mLabelParams.mRowNameIdx + 1)) = str;
+          converter.ToStr(pRow[i], str);
+          row.at(i + static_cast<size_t>(mLabelParams.mRowNameIdx + 1)) = str;
         }
       }
 
       while (rowIdx > GetDataRowCount())
       {
-        std::vector<std::string> tempRow;
-        tempRow.resize(GetDataColumnCount());
-        mData.push_back(tempRow);
+        mData.AppendRow(std::vector<std::string>(GetDataColumnCount()));
       }
 
-      mData.insert(mData.begin() + static_cast<std::ptrdiff_t>(rowIdx), row);
+      mData.InsertRow(rowIdx, row);
 
       if (!pRowName.empty())
       {
@@ -1180,7 +1605,7 @@ namespace rapidcsv
      */
     size_t GetRowCount() const
     {
-      const std::ptrdiff_t count = static_cast<std::ptrdiff_t>(mData.size()) -
+      const std::ptrdiff_t count = static_cast<std::ptrdiff_t>(mData.RowCount()) -
         (mLabelParams.mColumnNameIdx + 1);
       return (count >= 0) ? static_cast<size_t>(count) : 0;
     }
@@ -1195,8 +1620,7 @@ namespace rapidcsv
     T GetCell(const size_t pColumnIdx, const size_t pRowIdx) const
     {
       T val;
-      Converter<T> converter(mConverterParams);
-      converter.ToVal(GetCellRef(pColumnIdx, pRowIdx), val);
+      GetCellTo(pColumnIdx, pRowIdx, val, std::is_same<T, std::string>());
       return val;
     }
 
@@ -1211,7 +1635,7 @@ namespace rapidcsv
     T GetCell(const size_t pColumnIdx, const size_t pRowIdx, ConvFunc<T> pToVal) const
     {
       T val;
-      pToVal(GetCellRef(pColumnIdx, pRowIdx), val);
+      pToVal(GetCellValue(pColumnIdx, pRowIdx), val);
       return val;
     }
 
@@ -1347,25 +1771,24 @@ namespace rapidcsv
     template<typename T>
     void SetCell(const size_t pColumnIdx, const size_t pRowIdx, const T& pCell)
     {
+      mData.RequireEditable();
       const size_t dataColumnIdx = GetDataColumnIndex(pColumnIdx);
       const size_t dataRowIdx = GetDataRowIndex(pRowIdx);
 
       while ((dataRowIdx + 1) > GetDataRowCount())
       {
-        std::vector<std::string> row;
-        row.resize(GetDataColumnCount());
-        mData.push_back(row);
+        mData.AppendRow(std::vector<std::string>(GetDataColumnCount()));
       }
 
       if ((dataColumnIdx + 1) > GetDataColumnCount())
       {
-        for (auto itRow = mData.begin(); itRow != mData.end(); ++itRow)
+        for (size_t r = 0; r < mData.RowCount(); ++r)
         {
-          if (std::distance(mData.begin(), itRow) >= mLabelParams.mColumnNameIdx)
+          if (static_cast<std::ptrdiff_t>(r) >= mLabelParams.mColumnNameIdx)
           {
-            if (itRow->size() < (dataColumnIdx + 1))
+            if (mData.RowWidth(r) < (dataColumnIdx + 1))
             {
-              itRow->resize(dataColumnIdx + 1);
+              mData.ResizeRow(r, dataColumnIdx + 1);
             }
           }
         }
@@ -1374,7 +1797,7 @@ namespace rapidcsv
       std::string str;
       Converter<T> converter(mConverterParams);
       converter.ToStr(pCell, str);
-      mData.at(dataRowIdx).at(dataColumnIdx) = str;
+      mData.Set(dataRowIdx, dataColumnIdx, str);
     }
 
     /**
@@ -1450,7 +1873,7 @@ namespace rapidcsv
         throw std::out_of_range("column name row index < 0: " + std::to_string(mLabelParams.mColumnNameIdx));
       }
 
-      return mData.at(static_cast<size_t>(mLabelParams.mColumnNameIdx)).at(dataColumnIdx);
+      return mData.Get(static_cast<size_t>(mLabelParams.mColumnNameIdx), dataColumnIdx);
     }
 
     /**
@@ -1460,6 +1883,7 @@ namespace rapidcsv
      */
     void SetColumnName(size_t pColumnIdx, const std::string& pColumnName)
     {
+      mData.RequireEditable();
       if (mLabelParams.mColumnNameIdx < 0)
       {
         throw std::out_of_range("column name row index < 0: " + std::to_string(mLabelParams.mColumnNameIdx));
@@ -1469,27 +1893,25 @@ namespace rapidcsv
 
       // remove old name from map before adding new one
       const size_t nameRowIdx = static_cast<size_t>(mLabelParams.mColumnNameIdx);
-      if ((nameRowIdx < mData.size()) && (dataColumnIdx < mData.at(nameRowIdx).size()))
+      if ((nameRowIdx < mData.RowCount()) && (dataColumnIdx < mData.RowWidth(nameRowIdx)))
       {
-        const std::string oldName = mData.at(nameRowIdx).at(dataColumnIdx);
+        const std::string oldName = mData.Get(nameRowIdx, dataColumnIdx);
         mColumnNames.erase(oldName);
       }
       mColumnNames[pColumnName] = dataColumnIdx;
 
       // increase table size if necessary:
-      const size_t rowIdx = static_cast<size_t>(mLabelParams.mColumnNameIdx);
-      if (rowIdx >= mData.size())
+      while (mData.RowCount() < (nameRowIdx + 1))
       {
-        mData.resize(rowIdx + 1);
+        mData.AppendRow(std::vector<std::string>());
       }
 
-      std::vector<std::string>& row = mData[rowIdx];
-      if (dataColumnIdx >= row.size())
+      if (dataColumnIdx >= mData.RowWidth(nameRowIdx))
       {
-        row.resize(dataColumnIdx + 1);
+        mData.ResizeRow(nameRowIdx, dataColumnIdx + 1);
       }
 
-      mData.at(static_cast<size_t>(mLabelParams.mColumnNameIdx)).at(dataColumnIdx) = pColumnName;
+      mData.Set(nameRowIdx, dataColumnIdx, pColumnName);
     }
 
     /**
@@ -1500,11 +1922,17 @@ namespace rapidcsv
     {
       if (mLabelParams.mColumnNameIdx >= 0)
       {
-        const std::vector<std::string>& labelRow = mData.at(static_cast<size_t>(mLabelParams.mColumnNameIdx));
+        const size_t nameRowIdx = static_cast<size_t>(mLabelParams.mColumnNameIdx);
         const size_t offset = static_cast<size_t>(mLabelParams.mRowNameIdx + 1);
-        if (offset <= labelRow.size())
+        const size_t width = mData.RowWidth(nameRowIdx);
+        if (offset <= width)
         {
-          return std::vector<std::string>(labelRow.begin() + static_cast<std::ptrdiff_t>(offset), labelRow.end());
+          std::vector<std::string> names;
+          for (size_t c = offset; c < width; ++c)
+          {
+            names.push_back(mData.Get(nameRowIdx, c));
+          }
+          return names;
         }
       }
 
@@ -1524,7 +1952,7 @@ namespace rapidcsv
         throw std::out_of_range("row name column index < 0: " + std::to_string(mLabelParams.mRowNameIdx));
       }
 
-      return mData.at(dataRowIdx).at(static_cast<size_t>(mLabelParams.mRowNameIdx));
+      return mData.Get(dataRowIdx, static_cast<size_t>(mLabelParams.mRowNameIdx));
     }
 
     /**
@@ -1534,13 +1962,14 @@ namespace rapidcsv
      */
     void SetRowName(size_t pRowIdx, const std::string& pRowName)
     {
+      mData.RequireEditable();
       const size_t dataRowIdx = GetDataRowIndex(pRowIdx);
 
       // remove old name from map before adding new one
-      if ((mLabelParams.mRowNameIdx >= 0) && (dataRowIdx < mData.size()) &&
-          (static_cast<size_t>(mLabelParams.mRowNameIdx) < mData.at(dataRowIdx).size()))
+      if ((mLabelParams.mRowNameIdx >= 0) && (dataRowIdx < mData.RowCount()) &&
+          (static_cast<size_t>(mLabelParams.mRowNameIdx) < mData.RowWidth(dataRowIdx)))
       {
-        const std::string oldName = mData.at(dataRowIdx).at(static_cast<size_t>(mLabelParams.mRowNameIdx));
+        const std::string oldName = mData.Get(dataRowIdx, static_cast<size_t>(mLabelParams.mRowNameIdx));
         mRowNames.erase(oldName);
       }
       mRowNames[pRowName] = dataRowIdx;
@@ -1550,18 +1979,18 @@ namespace rapidcsv
       }
 
       // increase table size if necessary:
-      if (dataRowIdx >= mData.size())
+      while (dataRowIdx >= mData.RowCount())
       {
-        mData.resize(dataRowIdx + 1);
+        mData.AppendRow(std::vector<std::string>());
       }
 
-      std::vector<std::string>& row = mData[dataRowIdx];
-      if (mLabelParams.mRowNameIdx >= static_cast<std::ptrdiff_t>(row.size()))
+      const size_t nameColIdx = static_cast<size_t>(mLabelParams.mRowNameIdx);
+      if (nameColIdx >= mData.RowWidth(dataRowIdx))
       {
-        row.resize(static_cast<size_t>(mLabelParams.mRowNameIdx) + 1);
+        mData.ResizeRow(dataRowIdx, nameColIdx + 1);
       }
 
-      mData.at(dataRowIdx).at(static_cast<size_t>(mLabelParams.mRowNameIdx)) = pRowName;
+      mData.Set(dataRowIdx, nameColIdx, pRowName);
     }
 
     /**
@@ -1573,11 +2002,11 @@ namespace rapidcsv
       std::vector<std::string> rownames;
       if (mLabelParams.mRowNameIdx >= 0)
       {
-        for (auto itRow = mData.begin(); itRow != mData.end(); ++itRow)
+        for (size_t r = 0; r < mData.RowCount(); ++r)
         {
-          if (std::distance(mData.begin(), itRow) > mLabelParams.mColumnNameIdx)
+          if (static_cast<std::ptrdiff_t>(r) > mLabelParams.mColumnNameIdx)
           {
-            rownames.push_back(itRow->at(static_cast<size_t>(mLabelParams.mRowNameIdx)));
+            rownames.push_back(mData.Get(r, static_cast<size_t>(mLabelParams.mRowNameIdx)));
           }
         }
       }
@@ -1585,17 +2014,18 @@ namespace rapidcsv
     }
 
   private:
-    void ReadCsv()
+    void ReadCsv(const bool pReadOnly)
     {
       std::ifstream stream;
       stream.exceptions(std::ifstream::failbit | std::ifstream::badbit);
       stream.open(mPath, std::ios::binary);
-      ReadCsv(stream);
+      ReadCsv(stream, pReadOnly);
     }
 
-    void ReadCsv(std::istream& pStream)
+    void ReadCsv(std::istream& pStream, const bool pReadOnly)
     {
       Clear();
+      mData.Reset(pReadOnly);
       pStream.seekg(0, std::ios::end);
       std::streamsize length = pStream.tellg();
       pStream.seekg(0, std::ios::beg);
@@ -1672,11 +2102,46 @@ namespace rapidcsv
     {
       const std::streamsize bufLength = 64 * 1024;
       std::vector<char> buffer(bufLength);
-      std::vector<std::string> row;
       std::string cell;
+      size_t cellsInRow = 0;   // cells seen in the current record
+      bool skipRow = false;    // the current record is a comment line to be dropped
       bool quoted = false;
       int cr = 0;
       int lf = 0;
+
+      // Completes the current cell and adds it to the current record.
+      const auto addCell = [&]() {
+        std::string value = FinishCell(std::move(cell));
+        cell.clear();
+        if (cellsInRow == 0)
+        {
+          mData.BeginRow();
+          skipRow = mLineReaderParams.mSkipCommentLines && !value.empty() &&
+            (value[0] == mLineReaderParams.mCommentPrefix);
+        }
+        CheckMaxCount(cellsInRow + 1);
+        if (!skipRow)
+        {
+          mData.AppendCell(value);
+        }
+        ++cellsInRow;
+      };
+
+      // Completes the current record: it is stored, or dropped if it is a comment line.
+      const auto endRecord = [&]() {
+        if (skipRow)
+        {
+          mData.DiscardRow();
+        }
+        else
+        {
+          CheckMaxCount(mData.RowCount() + 1);
+          mData.EndRow();
+        }
+        cellsInRow = 0;
+        skipRow = false;
+        quoted = false;
+      };
 
       while (p_FileLength > 0)
       {
@@ -1714,9 +2179,7 @@ namespace rapidcsv
           {
             if (!quoted)
             {
-              CheckMaxCount(row.size() + 1);
-              row.push_back(FinishCell(std::move(cell)));
-              cell.clear();
+              addCell();
             }
             else
             {
@@ -1747,34 +2210,19 @@ namespace rapidcsv
               if (quoted)
               {
                 const std::string errStr = "unterminated quoted field in record " +
-                  std::to_string(mData.size() + 1) + " (line break inside quotes requires pQuotedLinebreaks)";
+                  std::to_string(mData.RowCount() + 1) + " (line break inside quotes requires pQuotedLinebreaks)";
                 throw std::runtime_error(errStr);
               }
 
               ++lf;
-              if (mLineReaderParams.mSkipEmptyLines && row.empty() && cell.empty())
+              if (mLineReaderParams.mSkipEmptyLines && (cellsInRow == 0) && cell.empty())
               {
                 // skip empty line
               }
               else
               {
-                CheckMaxCount(row.size() + 1);
-                row.push_back(FinishCell(std::move(cell)));
-
-                if (mLineReaderParams.mSkipCommentLines && !row.at(0).empty() &&
-                    (row.at(0)[0] == mLineReaderParams.mCommentPrefix))
-                {
-                  // skip comment line
-                }
-                else
-                {
-                  CheckMaxCount(mData.size() + 1);
-                  StoreRecord(row);
-                }
-
-                cell.clear();
-                row.clear();
-                quoted = false;
+                addCell();
+                endRecord();
               }
             }
           }
@@ -1789,43 +2237,28 @@ namespace rapidcsv
       // An unterminated quoted field would otherwise swallow the rest of the input silently
       if (quoted)
       {
-        const std::string errStr = "unterminated quoted field in record " + std::to_string(mData.size() + 1);
+        const std::string errStr = "unterminated quoted field in record " + std::to_string(mData.RowCount() + 1);
         throw std::runtime_error(errStr);
       }
 
       // Handle last row / cell without linebreak
-      if (row.empty() && cell.empty())
+      if ((cellsInRow == 0) && cell.empty())
       {
         // skip empty trailing line
       }
       else
       {
-        CheckMaxCount(row.size() + 1);
-        row.push_back(FinishCell(std::move(cell)));
-
-        if (mLineReaderParams.mSkipCommentLines && !row.at(0).empty() &&
-            (row.at(0)[0] == mLineReaderParams.mCommentPrefix))
-        {
-          // skip comment line
-        }
-        else
-        {
-          CheckMaxCount(mData.size() + 1);
-          StoreRecord(row);
-        }
-
-        cell.clear();
-        row.clear();
-        quoted = false;
+        addCell();
+        endRecord();
       }
+
+      mData.ShrinkToFit();
 
       // Assume CR/LF if at least half the linebreaks have CR
       mSeparatorParams.mHasCR = (cr > (lf / 2));
 
       // Set up column labels
       UpdateColumnNames();
-
-      // Set up row labels
       UpdateRowNames();
     }
 
@@ -1858,17 +2291,22 @@ namespace rapidcsv
 
     void WriteCsv(std::ostream& pStream) const
     {
-      for (auto itr = mData.begin(); itr != mData.end(); ++itr)
+      // One cell buffer is reused for the whole table: no per-row vector, no per-cell copy.
+      std::string cell;
+      const char* const eol = mSeparatorParams.mHasCR ? "\r\n" : "\n";
+      for (size_t r = 0; r < mData.RowCount(); ++r)
       {
-        for (auto itc = itr->begin(); itc != itr->end(); ++itc)
+        const size_t width = mData.RowWidth(r);
+        for (size_t c = 0; c < width; ++c)
         {
+          mData.CopyCell(r, c, cell);
           if (mSeparatorParams.mAutoQuote &&
-              ((itc->find(mSeparatorParams.mSeparator) != std::string::npos) ||
-               (itc->find(mSeparatorParams.mQuoteChar) != std::string::npos) ||
-               (itc->find_first_of(" \t\n\v\f\r") != std::string::npos)))
+              ((cell.find(mSeparatorParams.mSeparator) != std::string::npos) ||
+               (cell.find(mSeparatorParams.mQuoteChar) != std::string::npos) ||
+               (cell.find_first_of(" \t\n\v\f\r") != std::string::npos)))
           {
             // escape quotes in string
-            std::string str = *itc;
+            std::string str = cell;
             const std::string quoteCharStr = std::string(1, mSeparatorParams.mQuoteChar);
             ReplaceString(str, quoteCharStr, quoteCharStr + quoteCharStr);
 
@@ -1876,28 +2314,28 @@ namespace rapidcsv
           }
           else
           {
-            pStream << *itc;
+            pStream << cell;
           }
 
-          if (std::distance(itc, itr->end()) > 1)
+          if (c + 1 < width)
           {
             pStream << mSeparatorParams.mSeparator;
           }
         }
-        pStream << (mSeparatorParams.mHasCR ? "\r\n" : "\n");
+        pStream << eol;
       }
     }
 
     size_t GetDataRowCount() const
     {
-      return mData.size();
+      return mData.RowCount();
     }
 
     size_t GetDataColumnCount() const
     {
       const size_t firstDataRow =
         static_cast<size_t>((mLabelParams.mColumnNameIdx >= 0) ? mLabelParams.mColumnNameIdx : 0);
-      return (mData.size() > firstDataRow) ? mData.at(firstDataRow).size() : 0;
+      return (mData.RowCount() > firstDataRow) ? mData.RowWidth(firstDataRow) : 0;
     }
 
     inline size_t GetDataRowIndex(const size_t pRowIdx) const
@@ -1923,29 +2361,62 @@ namespace rapidcsv
      * @returns reference to the raw cell string.
      * @throws  std::out_of_range if the row or the column does not exist.
      */
-    const std::string& GetCellRef(const size_t pColumnIdx, const size_t pRowIdx) const
+    std::string GetCellValue(const size_t pColumnIdx, const size_t pRowIdx) const
+    {
+      std::string value;
+      GetCellInto(pColumnIdx, pRowIdx, value);
+      return value;
+    }
+
+    /**
+     * @brief   Copies one cell into pValue, validating the indices once.
+     * @param   pColumnIdx            column index, as seen by the user
+     * @param   pRowIdx               row index, as seen by the user
+     * @param   pValue                destination string, overwritten
+     * @throws  std::out_of_range     if the row or column does not exist
+     */
+    void GetCellInto(const size_t pColumnIdx, const size_t pRowIdx, std::string& pValue) const
     {
       const size_t dataRowIdx = GetDataRowIndex(pRowIdx);
-      if (dataRowIdx >= mData.size())
+      if (dataRowIdx >= mData.RowCount())
       {
         const std::string errStr = "row index " + std::to_string(pRowIdx) +
           " out of range (rows: " + std::to_string(GetRowCount()) + ")";
         throw std::out_of_range(errStr);
       }
 
-      const std::vector<std::string>& row = mData[dataRowIdx];
+      const size_t width = mData.RowWidth(dataRowIdx);
       const size_t dataColumnIdx = GetDataColumnIndex(pColumnIdx);
-      if (dataColumnIdx >= row.size())
+      if (dataColumnIdx >= width)
       {
         const size_t firstDataColumn = GetDataColumnIndex(0);
-        const size_t dataCells = (row.size() > firstDataColumn) ? row.size() - firstDataColumn : 0;
+        const size_t dataCells = (width > firstDataColumn) ? width - firstDataColumn : 0;
         const std::string errStr = "column index " + std::to_string(pColumnIdx) +
           " out of range for row " + std::to_string(pRowIdx) +
           " (row has " + std::to_string(dataCells) + " cells)";
         throw std::out_of_range(errStr);
       }
 
-      return row[dataColumnIdx];
+      mData.CopyCell(dataRowIdx, dataColumnIdx, pValue);
+    }
+
+    /**
+     * @brief   GetCell() for std::string: copies the stored cell directly into the result.
+     */
+    void GetCellTo(const size_t pColumnIdx, const size_t pRowIdx, std::string& pVal,
+                   std::true_type) const
+    {
+      GetCellInto(pColumnIdx, pRowIdx, pVal);
+    }
+
+    /**
+     * @brief   GetCell() for any other type: converts the stored cell with Converter<T>.
+     */
+    template<typename T>
+    void GetCellTo(const size_t pColumnIdx, const size_t pRowIdx, T& pVal, std::false_type) const
+    {
+      Converter<T> converter(mConverterParams);
+      converter.ToVal(GetCellValue(pColumnIdx, pRowIdx), pVal);
     }
 
     /**
@@ -1985,30 +2456,17 @@ namespace rapidcsv
       return pStr;
     }
 
-    /**
-     * @brief   Moves a completed record into the document.
-     * @details Leaves pRow empty and reserved to the width of the record just stored, so the
-     *          next record is built without repeated reallocation.
-     * @param   pRow                  record to store; empty on return.
-     */
-    void StoreRecord(std::vector<std::string>& pRow)
-    {
-      const size_t width = pRow.size();
-      mData.push_back(std::move(pRow));
-      pRow.clear();
-      pRow.reserve(width);
-    }
-
     void UpdateColumnNames()
     {
       mColumnNames.clear();
       if ((mLabelParams.mColumnNameIdx >= 0) &&
-          (static_cast<std::ptrdiff_t>(mData.size()) > mLabelParams.mColumnNameIdx))
+          (static_cast<std::ptrdiff_t>(mData.RowCount()) > mLabelParams.mColumnNameIdx))
       {
-        size_t i = 0;
-        for (auto& columnName : mData[static_cast<size_t>(mLabelParams.mColumnNameIdx)])
+        const size_t nameRowIdx = static_cast<size_t>(mLabelParams.mColumnNameIdx);
+        const size_t width = mData.RowWidth(nameRowIdx);
+        for (size_t i = 0; i < width; ++i)
         {
-          mColumnNames[columnName] = i++;
+          mColumnNames[mData.Get(nameRowIdx, i)] = i;
         }
       }
     }
@@ -2017,18 +2475,16 @@ namespace rapidcsv
     {
       mRowNames.clear();
       if ((mLabelParams.mRowNameIdx >= 0) &&
-          (static_cast<std::ptrdiff_t>(mData.size()) >
+          (static_cast<std::ptrdiff_t>(mData.RowCount()) >
            (mLabelParams.mColumnNameIdx + 1)))
       {
-        size_t i = 0;
-        for (auto& dataRow : mData)
+        for (size_t r = 0; r < mData.RowCount(); ++r)
         {
           // rows too short to hold a row label are left unnamed, but must still be counted
-          if (static_cast<std::ptrdiff_t>(dataRow.size()) > mLabelParams.mRowNameIdx)
+          if (static_cast<std::ptrdiff_t>(mData.RowWidth(r)) > mLabelParams.mRowNameIdx)
           {
-            mRowNames[dataRow[static_cast<size_t>(mLabelParams.mRowNameIdx)]] = i;
+            mRowNames[mData.Get(r, static_cast<size_t>(mLabelParams.mRowNameIdx))] = r;
           }
-          ++i;
         }
       }
     }
@@ -2237,7 +2693,7 @@ namespace rapidcsv
     SeparatorParams mSeparatorParams;
     ConverterParams mConverterParams;
     LineReaderParams mLineReaderParams;
-    std::vector<std::vector<std::string>> mData;
+    CellTable mData;
     std::map<std::string, size_t> mColumnNames;
     std::map<std::string, size_t> mRowNames;
     bool mIsUtf16 = false;
